@@ -1,4 +1,4 @@
-name: Build Lightpanda (V8 + Lightpanda, musl static)
+name: Build Lightpanda musl (V8 musl + resume cache)
 
 on:
   workflow_dispatch:
@@ -8,45 +8,49 @@ env:
   TARGET: aarch64-linux-musl
 
 jobs:
+  # ===== Job 1: 编译 musl 版 V8(arm runner,断点续传缓存,240min)=====
   build-v8-musl:
     runs-on: ubuntu-22.04-arm
-    timeout-minutes: 120
+    timeout-minutes: 240
 
     steps:
-      - name: Cache V8 musl lib
-        id: cache-v8
-        uses: actions/cache@v4
-        with:
-          path: libc_v8_musl.a
-          key: libc_v8_${{ env.V8_VERSION }}_linux_aarch64_musl
-
-      - if: steps.cache-v8.outputs.cache-hit != 'true'
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           repository: lightpanda-io/zig-v8-fork
           fetch-depth: 0
 
       - uses: mlugg/setup-zig@v2
 
-      - name: Zig 0.16 zip-fetch workaround
+      - name: Zig zip-fetch workaround
         run: mkdir -p "${ZIG_GLOBAL_CACHE_DIR:-$HOME/.cache/zig}/tmp"
 
       - name: Install deps
-        if: steps.cache-v8.outputs.cache-hit != 'true'
         run: |
           sudo apt-get update
           sudo apt-get install -yq libglib2.0-dev lld wget ca-certificates
           wget https://apt.llvm.org/llvm.sh && chmod +x llvm.sh
-          sudo ./llvm.sh 23
+          sudo ./llvm.sh 23 || echo "llvm.sh 失败,继续"
           CLANG_DIR=/usr/lib/llvm-23/lib/clang/23
           sudo ln -nsf "$CLANG_DIR/lib/linux/libclang_rt.builtins-aarch64.a" "$CLANG_DIR/lib/linux/libclang_rt.builtins.a" || true
           sudo ln -nsf "$CLANG_DIR/lib/linux" "$CLANG_DIR/lib/aarch64-unknown-linux-gnu" || true
 
+      # 缓存整个 V8 构建目录 —— 超时重跑时增量续编
+      - name: Cache V8 build dir
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            .lp-cache
+            libc_v8_musl.a
+          key: v8-musl-${{ github.run_id }}
+          restore-keys: |
+            v8-musl-
+
       - name: Build V8 (musl)
-        if: steps.cache-v8.outputs.cache-hit != 'true'
+        if: steps.cache.outputs.cache-hit != 'true'
         run: zig build -Dtarget="${{ env.TARGET }}" -Doptimize=ReleaseSafe build-v8
 
-      - name: Find V8 lib
+      - name: Find & pack V8 lib
         run: |
           if [ ! -f libc_v8_musl.a ]; then
             V8_LIB=$(find .lp-cache -name "libc_v8.a" 2>/dev/null | head -1)
@@ -54,16 +58,17 @@ jobs:
             cp "$V8_LIB" libc_v8_musl.a
           fi
           ls -la libc_v8_musl.a
+          echo "V8 lib ready"
 
       - name: Upload V8 musl lib
-        if: steps.cache-v8.outputs.cache-hit != 'true'
         uses: actions/upload-artifact@v4
         with:
           name: libc_v8_musl
           path: libc_v8_musl.a
           retention-days: 14
 
-  build-lightpanda-musl:
+  # ===== Job 2: 编译 Lightpanda(arm runner,不编 V8,30min 足够)=====
+  build-lightpanda:
     needs: build-v8-musl
     runs-on: ubuntu-22.04-arm
     timeout-minutes: 30
@@ -71,41 +76,34 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          repository: lightpanda-io/browser
           fetch-depth: 0
 
       - name: Install apt deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y wget xz-utils ca-certificates clang make git
+          sudo apt-get install -y wget xz-utils ca-certificates clang make git binutils
 
       - uses: mlugg/setup-zig@v2
 
-      - name: Zig 0.16 zip-fetch workaround
+      - name: Zig zip-fetch workaround
         run: mkdir -p "${ZIG_GLOBAL_CACHE_DIR:-$HOME/.cache/zig}/tmp"
 
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: stable
 
-      - name: Restore musl V8 lib from cache
-        id: cache-v8
-        uses: actions/cache@v4
-        with:
-          path: v8/libc_v8.a
-          key: libc_v8_${{ env.V8_VERSION }}_linux_aarch64_musl
-
-      - name: Fetch V8 lib from previous job
-        if: steps.cache-v8.outputs.cache-hit != 'true'
+      - name: Fetch musl V8 lib
         uses: actions/download-artifact@v4
         with:
           name: libc_v8_musl
           path: v8/
 
-      - name: Ensure v8 dir
+      - name: Prepare v8 dir
         run: |
           mkdir -p v8
-          [ -f v8/libc_v8.a ] || { find / -name libc_v8_musl.a 2>/dev/null | head -1 | xargs -I{} cp {} v8/libc_v8.a; }
           ls -la v8/
+          [ -f v8/libc_v8.a ] || find / -name "libc_v8_musl.a" 2>/dev/null | head -1 | xargs -I{} cp {} v8/libc_v8.a
 
       - name: v8 snapshot (musl)
         run: zig build -Dprebuilt_v8_path=v8/libc_v8.a -Dtarget=${{ env.TARGET }} -Doptimize=ReleaseFast snapshot_creator -- src/snapshot.bin
@@ -117,9 +115,9 @@ jobs:
             -Dtarget=${{ env.TARGET }} \
             -Doptimize=ReleaseFast \
             -Dcpu=generic \
-            -Dversion=musl-build
+            -Dversion=musl-build 2>&1 | tail -30
 
-      - name: Verify static linkage
+      - name: Verify linkage
         run: |
           echo "=== NEEDED ==="
           readelf -d zig-out/bin/lightpanda | grep NEEDED || echo "(no NEEDED - fully static!)"
@@ -128,7 +126,8 @@ jobs:
           file zig-out/bin/lightpanda
           ls -la zig-out/bin/lightpanda
 
-      - name: Upload Lightpanda binary
+      - name: Upload binary
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: lightpanda-aarch64-musl
