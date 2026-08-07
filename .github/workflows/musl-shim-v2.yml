@@ -49,7 +49,19 @@ jobs:
           echo "shim injected into libc_v8.a"
 
       - name: v8 snapshot (musl target)
-        run: zig build -Dprebuilt_v8_path=v8/libc_v8.a -Dtarget=${{ env.TARGET }} -Doptimize=ReleaseFast snapshot_creator -- src/snapshot.bin
+        run: |
+          sudo apt-get install -y gdb > /dev/null 2>&1 || true
+          zig build -Dprebuilt_v8_path=v8/libc_v8.a -Dtarget=${{ env.TARGET }} -Doptimize=ReleaseFast snapshot_creator -- src/snapshot.bin 2>&1 | tail -8
+          RC=${PIPESTATUS[0]}
+          if [ $RC -ne 0 ]; then
+            BIN=$(find .zig-cache -name "lightpanda-snapshot-creator" -type f | head -1)
+            echo "=== binary: $BIN ==="
+            if [ -n "$BIN" ]; then
+              echo "=== gdb backtrace ==="
+              gdb -batch -ex "set pagination off" -ex run -ex "bt 25" -ex "info registers pc sp" --args "$BIN" src/snapshot.bin 2>&1 | tail -45
+            fi
+            exit $RC
+          fi
 
       - name: zig build (musl + shimmed V8)
         run: |
