@@ -1,10 +1,15 @@
 name: Auto-build musl on new upstream tag
 
 # Upstream tags do NOT propagate to a fork, so we poll upstream on a schedule.
-# When a new semver tag appears and we haven't released "<tag>-musl" yet, we
-# dispatch the musl-release workflow pinned to that upstream tag.
+# When a new semver tag appears and we haven't released "<tag>-musl" yet, we run
+# the musl build for that exact upstream tag.
 #
-# To force a check from the Actions tab: Run workflow -> Auto-build musl on new upstream tag.
+# The build is invoked as a REUSABLE workflow (`uses:`) rather than dispatched
+# with `gh workflow run`: a dispatch made with the default GITHUB_TOKEN does not
+# start a new workflow run (GitHub blocks token-triggered recursion), so `uses:`
+# is the only reliable way to chain them.
+#
+# Force a check now: Actions tab -> "Auto-build musl on new upstream tag" -> Run workflow.
 
 on:
   schedule:
@@ -12,13 +17,15 @@ on:
   workflow_dispatch: {}
 
 permissions:
-  contents: write   # read existing releases
-  actions: write    # dispatch the build workflow
+  contents: write
 
 jobs:
-  detect-and-trigger:
+  detect:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    outputs:
+      tag: ${{ steps.up.outputs.tag }}
+      exists: ${{ steps.rel.outputs.exists }}
     steps:
       - name: Find latest upstream semver tag
         id: up
@@ -47,14 +54,13 @@ jobs:
             echo "exists=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Trigger musl build for the new tag
-        if: steps.rel.outputs.exists == 'false'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          gh workflow run musl-release.yml -R "${{ github.repository }}" \
-            -f release_tag="${{ steps.up.outputs.tag }}-musl" \
-            -f upstream_ref="${{ steps.up.outputs.tag }}" \
-            -f prerelease="true"
-          echo "dispatched musl-release.yml for upstream ${{ steps.up.outputs.tag }} -> release ${{ steps.up.outputs.tag }}-musl"
+  build-and-release:
+    needs: detect
+    if: needs.detect.outputs.exists == 'false'
+    uses: ./.github/workflows/musl-release.yml
+    with:
+      release_tag: ${{ needs.detect.outputs.tag }}-musl
+      upstream_ref: ${{ needs.detect.outputs.tag }}
+      prerelease: 'true'
+    permissions:
+      contents: write
