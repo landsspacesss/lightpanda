@@ -21,11 +21,11 @@ pub fn asNode(self: *Table) *Node {
     return self.asElement().asNode();
 }
 
-pub fn getTBodies(self: *Table, frame: *Frame) collections.NodeLive(.child_tag) {
+fn getTBodies(self: *Table, frame: *Frame) collections.NodeLive(.child_tag) {
     return collections.NodeLive(.child_tag).init(self.asNode(), .tbody, frame);
 }
 
-pub fn deleteRow(self: *Table, index: i32, frame: *Frame) !void {
+fn deleteRow(self: *Table, index: i32, frame: *Frame) !void {
     if (index < -1) {
         return error.IndexSizeError;
     }
@@ -121,6 +121,17 @@ pub const JsApi = struct {
         pub const prototype_chain = bridge.prototypeChain();
         pub var class_id: bridge.ClassId = undefined;
     };
+
+    const reflect = Element.Reflect(Table);
+    pub const width = reflect.string("width");
+    pub const summary = reflect.string("summary");
+    pub const rules = reflect.string("rules");
+    pub const frame = reflect.string("frame");
+    pub const cellSpacing = reflect.stringNullToEmpty("cellspacing");
+    pub const cellPadding = reflect.stringNullToEmpty("cellpadding");
+    pub const border = reflect.string("border");
+    pub const bgColor = reflect.stringNullToEmpty("bgcolor");
+    pub const @"align" = reflect.string("align");
 
     pub const tBodies = bridge.accessor(Table.getTBodies, null, .{});
     pub const deleteRow = bridge.function(Table.deleteRow, .{ .ce_reactions = true });

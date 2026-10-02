@@ -6,9 +6,8 @@ BC := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 # option test filter make test F="server"
 F=
 
-# Extra flags forwarded to every `$(ZIG) build` invocation. Most commonly used
-# to point at a prebuilt V8 archive and skip the multi-minute source rebuild:
-#   ZIGFLAGS=-Dprebuilt_v8_path=/path/to/libc_v8.a make test
+# Extra flags forwarded to every `$(ZIG) build` invocation, e.g.:
+#   ZIGFLAGS=-Ddev_fast=false make test
 ZIGFLAGS ?=
 
 # OS and ARCH
@@ -36,7 +35,8 @@ endif
 # Prebuilt V8
 # -----------
 # Building V8 from source takes 10+ minutes. `make download-v8` fetches the
-# matching prebuilt archive from the zig-v8-fork releases instead. The versions
+# matching prebuilt archive from the zig-v8-fork releases instead; build.zig
+# discovers the cached files itself, so the target only fetches. The versions
 # are read from the install action so they can't drift from CI.
 #
 # The cache path is keyed on ZIG_V8_TAG as well as the archive name: a
@@ -51,13 +51,11 @@ ZIG_V8_TAG := $(shell awk -F\' '/^  zig-v8:/{f=1} f&&/default:/{print $$2; exit}
 V8_ARCHIVE := libc_v8_$(V8_VERSION)_$(OS)_$(ARCH).a
 V8_CACHE   := .lp-cache/prebuilt-v8/$(ZIG_V8_TAG)/$(V8_ARCHIVE)
 
-# If the prebuilt archive is in place and the caller hasn't set ZIGFLAGS, point
-# the build at it rather than building V8 from source.
-ifeq ($(strip $(ZIGFLAGS)),)
-  ifneq ($(wildcard $(V8_CACHE)),)
-    ZIGFLAGS := -Dprebuilt_v8_path=$(V8_CACHE)
-  endif
-endif
+# The shared flavor serves -Ddev_fast (Linux x86_64 Debug only). It is cached
+# under the name the exe's DT_NEEDED records, libc_v8.so; the tag directory
+# already keys freshness.
+V8_SO_ASSET := libc_v8_$(V8_VERSION)_$(OS)_$(ARCH).so
+V8_SO_CACHE := .lp-cache/prebuilt-v8/$(ZIG_V8_TAG)/libc_v8.so
 
 
 # Infos
@@ -79,9 +77,16 @@ help:
 
 # $(ZIG) commands
 # ------------
-.PHONY: build build-v8-snapshot build-dev download-v8 run run-release test bench data end2end clean
+.PHONY: build build-v8-snapshot build-dev download-v8 run run-release test bench data end2end clean zig-cache-tmp
 
-## Download the prebuilt V8 archive (skips the 10+ min source build)
+# Zig 0.16.0 doesn't create <global cache>/tmp before fetching .zip deps.
+# https://codeberg.org/ziglang/zig/issues/31964
+zig-cache-tmp:
+	@dir=$$($(ZIG) env | sed -n 's/^ *\.global_cache_dir = "\(.*\)",$$/\1/p'); \
+	test -n "$$dir" || { printf "\033[33mCould not read global_cache_dir from '$(ZIG) env'\033[0m\n"; exit 1; }; \
+	mkdir -p "$$dir/tmp"
+
+## Download the prebuilt V8 libraries (skips the 10+ min source build)
 download-v8:
 	@mkdir -p $(dir $(V8_CACHE))
 	@test -f $(V8_CACHE) || ( \
@@ -90,9 +95,17 @@ download-v8:
 			https://github.com/lightpanda-io/zig-v8-fork/releases/download/$(ZIG_V8_TAG)/$(V8_ARCHIVE) \
 		|| (rm -f $(V8_CACHE); printf "\033[33mDownload ERROR\033[0m\n"; exit 1) )
 	@printf "\033[33mV8 ready: %s\033[0m\n" "$(V8_CACHE)"
+ifeq ($(OS)_$(ARCH),linux_x86_64)
+	@test -f $(V8_SO_CACHE) || ( \
+		printf "\033[36mDownloading prebuilt shared V8 $(V8_VERSION) ($(ZIG_V8_TAG))...\033[0m\n"; \
+		curl -fL --progress-bar -o $(V8_SO_CACHE) \
+			https://github.com/lightpanda-io/zig-v8-fork/releases/download/$(ZIG_V8_TAG)/$(V8_SO_ASSET) \
+		|| (rm -f $(V8_SO_CACHE); printf "\033[33mDownload ERROR\033[0m\n"; exit 1) )
+	@printf "\033[33mShared V8 ready: %s\033[0m\n" "$(V8_SO_CACHE)"
+endif
 
 ## Build v8 snapshot
-build-v8-snapshot:
+build-v8-snapshot: zig-cache-tmp
 	@printf "\033[36mBuilding v8 snapshot (release safe)...\033[0m\n"
 	@$(ZIG) build $(ZIGFLAGS) -Doptimize=ReleaseFast snapshot_creator -- src/snapshot.bin || (printf "\033[33mBuild ERROR\033[0m\n"; exit 1;)
 	@printf "\033[33mBuild OK\033[0m\n"
@@ -104,7 +117,7 @@ build: build-v8-snapshot
 	@printf "\033[33mBuild OK\033[0m\n"
 
 ## Build in debug mode
-build-dev:
+build-dev: zig-cache-tmp
 	@printf "\033[36mBuilding (debug)...\033[0m\n"
 	@$(ZIG) build $(ZIGFLAGS) || (printf "\033[33mBuild ERROR\033[0m\n"; exit 1;)
 	@printf "\033[33mBuild OK\033[0m\n"
@@ -119,8 +132,8 @@ run-debug: build-dev
 	@printf "\033[36mRunning...\033[0m\n"
 	@./zig-out/bin/lightpanda || (printf "\033[33mRun ERROR\033[0m\n"; exit 1;)
 
-test:
-	TEST_FILTER="${F}" $(ZIG) build $(ZIGFLAGS) test -freference-trace
+test: zig-cache-tmp
+	TEST_FILTER="$(or $(F),$(TEST_FILTER))" $(ZIG) build $(ZIGFLAGS) test -freference-trace
 
 ## Run demo/runner end to end tests
 end2end:
@@ -132,13 +145,13 @@ end2end:
 ## without one only the deterministic layer runs. See ../demo/agent/README.md.
 test-agent:
 	@test -d ../demo
-	@test -x zig-out/bin/lightpanda || $(MAKE) build
+	@test -x zig-out/bin/lightpanda || $(MAKE) build ZIGFLAGS="$(ZIGFLAGS)"
 	@cd ../demo && ./agent/run.sh $(LAYER)
 
 ## Remove build artifacts (keeps .lp-cache/ and zig-pkg/ — slow to re-fetch)
 clean:
 	rm -rf zig-out .zig-cache src/snapshot.bin
-	cd src/html5ever && cargo clean
+	cd src/rust && cargo clean
 
 # Install and build required dependencies commands
 # ------------

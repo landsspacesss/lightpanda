@@ -22,13 +22,15 @@ const lp = @import("lightpanda");
 const js = @import("../../../js/js.zig");
 const Factory = @import("../../../Factory.zig");
 const Frame = @import("../../../Frame.zig");
+const Reaction = @import("../../../CustomElementReactions.zig").Reaction;
 
 const Node = @import("../../Node.zig");
 const Element = @import("../../Element.zig");
 const Document = @import("../../Document.zig");
-const HtmlElement = @import("../Html.zig");
+const TreeWalker = @import("../../TreeWalker.zig");
 const CustomElementDefinition = @import("../../CustomElementDefinition.zig");
-const Reaction = @import("../../../CustomElementReactions.zig").Reaction;
+
+const HtmlElement = @import("../Html.zig");
 
 const log = lp.log;
 const String = lp.String;
@@ -41,6 +43,9 @@ _tag_name: String,
 _definition: ?*CustomElementDefinition,
 _connected_callback_invoked: bool = false,
 _disconnected_callback_invoked: bool = false,
+_upgrade_failed: bool = false, // a failed upgrade is never retried
+_upgrade_in_progress: bool = false,
+_upgrade_candidate: bool = false, // listed in a frame's _undefined_custom_elements
 
 pub fn asElement(self: *Custom) *Element {
     return Factory.protoOf(self).asElement();
@@ -56,19 +61,36 @@ pub fn asNode(self: *Custom) *Node {
 // we queue a reaction so that a redundant enqueue (already-in-this-state)
 // is dropped, and a remove+re-insert in the same scope queues both reactions
 // in order. Fire-time is unconditional.
-
 pub fn enqueueConnectedCallbackOnElement(comptime from_parser: bool, element: *Element, frame: *Frame) error{OutOfMemory}!void {
     // Autonomous custom element
     if (element.is(Custom)) |custom| {
+        if (custom._upgrade_in_progress) return;
         // Upgrade if a definition exists but isn't yet attached
         if (custom._definition == null) {
+            if (custom._upgrade_failed) {
+                return;
+            }
+
+            {
+                // a document without a browsing context (DOMParser et al.) has
+                // no custom element.
+                const document = element.asNode().ownerDocument(frame) orelse return;
+                if (document._frame == null) {
+                    return;
+                }
+            }
+
             const name = custom._tag_name.str();
             if (frame.window._custom_elements._definitions.get(name)) |definition| {
                 const CustomElementRegistry = @import("../../CustomElementRegistry.zig");
                 CustomElementRegistry.upgradeCustomElement(custom, definition, frame) catch {};
                 return;
             }
-            // Element is undefined and no definition exists yet — nothing to queue.
+
+            if (!custom._upgrade_candidate) {
+                custom._upgrade_candidate = true;
+                try frame._undefined_custom_elements.append(frame.arena, custom);
+            }
             return;
         }
 
@@ -109,7 +131,7 @@ pub fn enqueueConnectedCallbackOnElement(comptime from_parser: bool, element: *E
 
 pub fn enqueueDisconnectedCallbackOnElement(element: *Element, frame: *Frame) void {
     if (element.is(Custom)) |custom| {
-        if (custom._definition == null) return;
+        if (custom._definition == null or custom._upgrade_in_progress) return;
         if (custom._disconnected_callback_invoked) return;
         custom._disconnected_callback_invoked = true;
         custom._connected_callback_invoked = false;
@@ -138,21 +160,45 @@ pub fn enqueueDisconnectedCallbackOnElement(element: *Element, frame: *Frame) vo
 
 // Enqueues an atomic-move reaction (moveBefore). Unlike connect/disconnect there
 // is no dedup state to flip: a move always fires, and the element's connected
-// state is unchanged by the move.
+// state is unchanged by the move. The element's shadow tree (if any) always
+// moves with it.
 pub fn enqueueMoveCallbackOnElement(element: *Element, frame: *Frame) void {
-    if (element.is(Custom)) |custom| {
-        if (custom._definition == null) return;
-    } else {
-        if (frame.getCustomizedBuiltInDefinition(element) == null) return;
+    const eligible = if (element.is(Custom)) |custom|
+        custom._definition != null and !custom._upgrade_in_progress
+    else
+        frame.getCustomizedBuiltInDefinition(element) != null;
+
+    if (eligible) {
+        frame._ce_reactions.enqueueMove(frame, element) catch |err| {
+            log.warn(.bug, "ce_reactions enqueue fail", .{ .err = err });
+        };
     }
-    frame._ce_reactions.enqueueMove(frame, element) catch |err| {
-        log.warn(.bug, "ce_reactions enqueue fail", .{ .err = err });
-    };
+
+    const shadow_root = element.hostedShadowRoot(frame) orelse return;
+    var tw = TreeWalker.FullExcludeSelf.Elements.init(shadow_root.asNode(), .{});
+    while (tw.next()) |el| {
+        enqueueMoveCallbackOnElement(el, frame);
+    }
+}
+
+// Reactions descend through the shadodom, so when an element is connected or
+// disconnected, we need to enqueue the connect/disconnect callback for any
+// nested element including those nested in a shadow root.
+pub fn enqueueShadowTreeCallbacks(host: *Element, comptime reaction: enum { connected, disconnected }, frame: *Frame) error{OutOfMemory}!void {
+    const shadow_root = host.hostedShadowRoot(frame) orelse return;
+    var tw = TreeWalker.FullExcludeSelf.Elements.init(shadow_root.asNode(), .{});
+    while (tw.next()) |el| {
+        switch (comptime reaction) {
+            .connected => try enqueueConnectedCallbackOnElement(false, el, frame),
+            .disconnected => enqueueDisconnectedCallbackOnElement(el, frame),
+        }
+        try enqueueShadowTreeCallbacks(el, reaction, frame);
+    }
 }
 
 pub fn enqueueAdoptedCallbackOnElement(element: *Element, old_document: *Document, new_document: *Document, frame: *Frame) void {
     if (element.is(Custom)) |custom| {
-        if (custom._definition == null) return;
+        if (custom._definition == null or custom._upgrade_in_progress) return;
     } else {
         if (frame.getCustomizedBuiltInDefinition(element) == null) return;
     }
@@ -163,6 +209,7 @@ pub fn enqueueAdoptedCallbackOnElement(element: *Element, old_document: *Documen
 
 pub fn enqueueAttributeChangedCallbackOnElement(element: *Element, name: String, old_value: ?String, new_value: ?String, namespace: ?String, frame: *Frame) void {
     if (element.is(Custom)) |custom| {
+        if (custom._upgrade_in_progress) return;
         const definition = custom._definition orelse return;
         if (!definition.isAttributeObserved(name)) return;
     } else {
@@ -178,6 +225,11 @@ pub fn enqueueAttributeChangedCallbackOnElement(element: *Element, name: String,
 // Filtering already happened at enqueue time, so just fire unconditionally.
 pub fn fireReaction(reaction: Reaction, frame: *Frame) void {
     switch (reaction) {
+        .upgrade => |u| {
+            if (u.element._definition != null or u.element._upgrade_failed) return;
+            const CustomElementRegistry = @import("../../CustomElementRegistry.zig");
+            CustomElementRegistry.upgradeCustomElement(u.element, u.definition, frame) catch {};
+        },
         .connected => |el| {
             if (el.is(Custom)) |custom| {
                 custom.invokeCallback("connectedCallback", .{}, frame);
@@ -257,9 +309,14 @@ pub fn checkAndAttachBuiltIn(element: *Element, frame: *Frame) !void {
 
     // Invoke constructor
     const prev_upgrading = frame._upgrading_element;
+    const prev_consumed = frame._upgrading_consumed;
     const node = element.asNode();
     frame._upgrading_element = node;
-    defer frame._upgrading_element = prev_upgrading;
+    frame._upgrading_consumed = false;
+    defer {
+        frame._upgrading_element = prev_upgrading;
+        frame._upgrading_consumed = prev_consumed;
+    }
 
     // PERFORMANCE OPTIMIZATION: This pattern is discouraged in general code.
     // Used here because: (1) multiple early returns before needing Local,
@@ -282,7 +339,7 @@ pub fn checkAndAttachBuiltIn(element: *Element, frame: *Frame) !void {
 
     var caught: js.TryCatch.Caught = .{};
     _ = local.toLocal(definition.constructor).newInstance(&caught) catch |err| {
-        log.warn(.js, "custom builtin ctor", .{ .name = is_value, .err = err, .caught = caught });
+        log.debug(.js, "custom builtin ctor", .{ .name = is_value, .err = err, .caught = caught });
         return;
     };
 }

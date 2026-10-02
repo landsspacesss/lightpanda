@@ -20,7 +20,7 @@ pub fn asNode(self: *Progress) *Node {
     return self.asElement().asNode();
 }
 
-pub fn getLabels(self: *Progress, frame: *Frame) !js.Array {
+fn getLabels(self: *Progress, frame: *Frame) !js.Array {
     return @import("Label.zig").getControlLabels(self.asElement(), frame);
 }
 
@@ -32,6 +32,9 @@ pub const JsApi = struct {
         pub const prototype_chain = bridge.prototypeChain();
         pub var class_id: bridge.ClassId = undefined;
     };
+
+    const reflect = Element.Reflect(Progress);
+    pub const max = reflect.double("max", 1.0, true);
 
     pub const labels = bridge.accessor(Progress.getLabels, null, .{});
 };

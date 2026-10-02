@@ -1,11 +1,36 @@
-const lp = @import("lightpanda");
+// Copyright (C) 2023-2025  Lightpanda (Selecy SAS)
+//
+// Francis Bouvier <francis@lightpanda.io>
+// Pierre Tachoire <pierre@lightpanda.io>
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as
+// published by the Free Software Foundation, either version 3 of the
+// License, or (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
 const std = @import("std");
+const lp = @import("lightpanda");
+
 const js = @import("../../../js/js.zig");
-const Factory = @import("../../../Factory.zig");
 const Frame = @import("../../../Frame.zig");
+const Factory = @import("../../../Factory.zig");
+const MediaQuery = @import("../../../css/MediaQuery.zig");
+
 const Node = @import("../../Node.zig");
 const Element = @import("../../Element.zig");
 const HtmlElement = @import("../Html.zig");
+
+const Picture = @import("Picture.zig");
+
+const String = lp.String;
 
 const Source = @This();
 
@@ -26,67 +51,61 @@ pub fn asNode(self: *Source) *Node {
 
 pub fn getSrc(self: *const Source, frame: *Frame) ![]const u8 {
     const element = self.asConstElement();
-    const src = element.getAttributeSafe(comptime .wrap("src")) orelse return "";
+    const src = element.getAttributeInterned("src") orelse return "";
     if (src.len == 0) {
         return "";
     }
     return element.asConstNode().resolveURLReflect(src, frame, .{});
 }
 
-pub fn setSrc(self: *Source, value: []const u8, frame: *Frame) !void {
+fn setSrc(self: *Source, value: []const u8, frame: *Frame) !void {
     try self.asElement().setAttributeSafe(comptime .wrap("src"), .wrap(value), frame);
 }
 
-pub fn getSrcset(self: *const Source) []const u8 {
-    return self.asConstElement().getAttributeSafe(comptime .wrap("srcset")) orelse "";
+pub fn selectableSrcset(self: *const Source, frame: *Frame) ?[]const u8 {
+    const element = self.asConstElement();
+    const srcset = element.getAttributeInterned("srcset") orelse return null;
+    if (srcset.len == 0) {
+        return null;
+    }
+    if (element.getAttributeInterned("media")) |media| {
+        if (std.mem.trim(u8, media, &std.ascii.whitespace).len > 0 and !MediaQuery.matches(media, frame.page.getViewport())) {
+            return null;
+        }
+    }
+    if (element.getAttributeInterned("type")) |mime| {
+        if (!isSupportedImageType(mime)) {
+            return null;
+        }
+    }
+    return srcset;
 }
 
-pub fn setSrcset(self: *Source, value: []const u8, frame: *Frame) !void {
-    try self.asElement().setAttributeSafe(comptime .wrap("srcset"), .wrap(value), frame);
-}
-
-pub fn getSizes(self: *const Source) []const u8 {
-    return self.asConstElement().getAttributeSafe(comptime .wrap("sizes")) orelse "";
-}
-
-pub fn setSizes(self: *Source, value: []const u8, frame: *Frame) !void {
-    try self.asElement().setAttributeSafe(comptime .wrap("sizes"), .wrap(value), frame);
-}
-
-pub fn getMedia(self: *const Source) []const u8 {
-    return self.asConstElement().getAttributeSafe(comptime .wrap("media")) orelse "";
-}
-
-pub fn setMedia(self: *Source, value: []const u8, frame: *Frame) !void {
-    try self.asElement().setAttributeSafe(comptime .wrap("media"), .wrap(value), frame);
-}
-
-pub fn getType(self: *const Source) []const u8 {
-    return self.asConstElement().getAttributeSafe(comptime .wrap("type")) orelse "";
-}
-
-pub fn setType(self: *Source, value: []const u8, frame: *Frame) !void {
-    try self.asElement().setAttributeSafe(comptime .wrap("type"), .wrap(value), frame);
-}
-
-pub fn getWidth(self: *const Source) u32 {
-    const attr = self.asConstElement().getAttributeSafe(comptime .wrap("width")) orelse return 0;
-    return std.fmt.parseUnsigned(u32, attr, 10) catch 0;
-}
-
-pub fn setWidth(self: *Source, value: u32, frame: *Frame) !void {
-    const str = try std.fmt.allocPrint(frame.call_arena, "{d}", .{value});
-    try self.asElement().setAttributeSafe(comptime .wrap("width"), .wrap(str), frame);
-}
-
-pub fn getHeight(self: *const Source) u32 {
-    const attr = self.asConstElement().getAttributeSafe(comptime .wrap("height")) orelse return 0;
-    return std.fmt.parseUnsigned(u32, attr, 10) catch 0;
-}
-
-pub fn setHeight(self: *Source, value: u32, frame: *Frame) !void {
-    const str = try std.fmt.allocPrint(frame.call_arena, "{d}", .{value});
-    try self.asElement().setAttributeSafe(comptime .wrap("height"), .wrap(str), frame);
+// Nothing is decoded, so claim the formats a mainstream browser does.
+fn isSupportedImageType(mime: []const u8) bool {
+    const essence = std.mem.trim(u8, mime[0 .. std.mem.indexOfScalar(u8, mime, ';') orelse mime.len], &std.ascii.whitespace);
+    if (essence.len == 0) {
+        return true;
+    }
+    const supported = [_][]const u8{
+        "image/apng",
+        "image/avif",
+        "image/bmp",
+        "image/gif",
+        "image/jpeg",
+        "image/jpg",
+        "image/png",
+        "image/svg+xml",
+        "image/vnd.microsoft.icon",
+        "image/webp",
+        "image/x-icon",
+    };
+    for (supported) |s| {
+        if (std.ascii.eqlIgnoreCase(essence, s)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 pub const JsApi = struct {
@@ -98,13 +117,35 @@ pub const JsApi = struct {
         pub var class_id: bridge.ClassId = undefined;
     };
 
-    pub const height = bridge.accessor(Source.getHeight, Source.setHeight, .{ .ce_reactions = true });
-    pub const media = bridge.accessor(Source.getMedia, Source.setMedia, .{ .ce_reactions = true });
-    pub const sizes = bridge.accessor(Source.getSizes, Source.setSizes, .{ .ce_reactions = true });
+    const reflect = Element.Reflect(Source);
+
+    pub const height = reflect.unsignedLong("height", .{});
+    pub const media = reflect.string("media");
+    pub const sizes = reflect.string("sizes");
     pub const src = bridge.accessor(Source.getSrc, Source.setSrc, .{ .ce_reactions = true });
-    pub const srcset = bridge.accessor(Source.getSrcset, Source.setSrcset, .{ .ce_reactions = true });
-    pub const @"type" = bridge.accessor(Source.getType, Source.setType, .{ .ce_reactions = true });
-    pub const width = bridge.accessor(Source.getWidth, Source.setWidth, .{ .ce_reactions = true });
+    pub const srcset = reflect.string("srcset");
+    pub const @"type" = reflect.string("type");
+    pub const width = reflect.unsignedLong("width", .{});
+};
+
+pub const Build = struct {
+    pub fn attributeChange(element: *Element, name: String, _: String, frame: *Frame) !void {
+        if (!isSelectionAttribute(name)) {
+            return;
+        }
+        return Picture.sourceChanged(element.asNode(), frame);
+    }
+
+    pub fn attributeRemove(element: *Element, name: String, frame: *Frame) !void {
+        if (!isSelectionAttribute(name)) {
+            return;
+        }
+        return Picture.sourceChanged(element.asNode(), frame);
+    }
+
+    fn isSelectionAttribute(name: String) bool {
+        return name.eql(comptime .wrap("srcset")) or name.eql(comptime .wrap("media")) or name.eql(comptime .wrap("type"));
+    }
 };
 
 const testing = @import("../../../../testing.zig");

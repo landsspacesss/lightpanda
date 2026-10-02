@@ -25,7 +25,7 @@ pub fn asNode(self: *TableSection) *Node {
     return self.asElement().asNode();
 }
 
-pub fn getRows(self: *TableSection, frame: *Frame) collections.NodeLive(.child_tag) {
+fn getRows(self: *TableSection, frame: *Frame) collections.NodeLive(.child_tag) {
     return collections.NodeLive(.child_tag).init(self.asNode(), .tr, frame);
 }
 
@@ -37,6 +37,12 @@ pub const JsApi = struct {
         pub const prototype_chain = bridge.prototypeChain();
         pub var class_id: bridge.ClassId = undefined;
     };
+
+    const reflect = Element.Reflect(TableSection);
+    pub const vAlign = reflect.string("valign");
+    pub const chOff = reflect.string("charoff");
+    pub const ch = reflect.string("char");
+    pub const @"align" = reflect.string("align");
 
     pub const rows = bridge.accessor(TableSection.getRows, null, .{});
 };

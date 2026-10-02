@@ -49,6 +49,21 @@ pub fn withThis(self: *const Function, value: anytype) !Function {
 }
 
 pub fn newInstance(self: *const Function, caught: *js.TryCatch.Caught) !js.Object {
+    var try_catch: js.TryCatch = undefined;
+    try_catch.init(self.local);
+    defer try_catch.deinit();
+
+    return self.newInstanceThrow() catch |err| {
+        if (err == error.JsConstructorFailed) {
+            caught.* = try_catch.caughtOrError(self.local.call_arena, error.Unknown);
+        }
+        return err;
+    };
+}
+
+// Like newInstance, but with no TryCatch of our own. Gives more flexibility to
+// the caller on how to handle the error (e.g. window.reportError)
+pub fn newInstanceThrow(self: *const Function) !js.Object {
     const local = self.local;
 
     if (comptime lp.IS_DEBUG == false) {
@@ -70,17 +85,12 @@ pub fn newInstance(self: *const Function, caught: *js.TryCatch.Caught) !js.Objec
         return error.ExecutionTerminated;
     }
 
-    var try_catch: js.TryCatch = undefined;
-    try_catch.init(local);
-    defer try_catch.deinit();
-
     // This creates a new instance using this Function as a constructor.
     // const c_args = @as(?[*]const ?*c.Value, @ptrCast(&.{}));
     const handle = v8.v8__Function__NewInstance(self.handle, local.handle, 0, null) orelse {
         if (local.ctx.env.terminatePending()) {
             return error.ExecutionTerminated;
         }
-        caught.* = try_catch.caughtOrError(local.call_arena, error.Unknown);
         return error.JsConstructorFailed;
     };
 
@@ -93,7 +103,7 @@ pub fn newInstance(self: *const Function, caught: *js.TryCatch.Caught) !js.Objec
 pub fn call(self: *const Function, comptime T: type, args: anytype) !T {
     var caught: js.TryCatch.Caught = .{};
     return self._tryCallWithThis(T, self.getThis(), args, &caught, .{}) catch |err| {
-        log.warn(.js, "call caught", .{ .err = err, .caught = caught });
+        log.debug(.js, "call caught", .{ .err = err, .caught = caught });
         return err;
     };
 }
@@ -104,7 +114,7 @@ pub fn callRethrow(self: *const Function, comptime T: type, args: anytype) !T {
         if (err != error.TryCatchRethrow) {
             // error.TryCatchRethrow is a control flow (sorry!), not an actual
             // error we want to log
-            log.warn(.js, "call caught", .{ .err = err, .caught = caught });
+            log.debug(.js, "call caught", .{ .err = err, .caught = caught });
         }
         return err;
     };
@@ -113,7 +123,7 @@ pub fn callRethrow(self: *const Function, comptime T: type, args: anytype) !T {
 pub fn callWithThis(self: *const Function, comptime T: type, this: anytype, args: anytype) !T {
     var caught: js.TryCatch.Caught = .{};
     return self._tryCallWithThis(T, this, args, &caught, .{}) catch |err| {
-        log.warn(.js, "callWithThis caught", .{ .err = err, .caught = caught });
+        log.debug(.js, "callWithThis caught", .{ .err = err, .caught = caught });
         return err;
     };
 }
@@ -335,6 +345,130 @@ test "Function: requested termination is classified and blocks re-entry" {
     // a top-level cancel restores normal execution
     env.cancelTerminate();
     try testing.expectEqual(3, try (try local.exec("1 + 2", null)).toI32());
+}
+
+test "Function: nested microtask checkpoint keeps the caller's termination" {
+    const frame = try testing.createFrame();
+    defer testing.test_session.closeAllPages();
+
+    var ls: js.Local.Scope = undefined;
+    frame.js.localScope(&ls);
+    defer ls.deinit();
+    const local = &ls.local;
+
+    const env = frame.js.env;
+    defer env.cancelTerminate();
+
+    const State = struct {
+        env: *js.Env,
+        local: *const js.Local,
+        resumed: bool = false,
+
+        fn kill(self: *@This()) void {
+            self.env.requestTerminate();
+        }
+
+        // Draining the queue from a native call runs at call depth >= 1, with
+        // the caller's JS still on the stack. A terminate landing in here is
+        // aimed at that caller too, so the checkpoint must not clear it.
+        fn pump(self: *@This()) void {
+            self.local.runMicrotasks();
+        }
+
+        fn markResumed(self: *@This()) void {
+            self.resumed = true;
+        }
+    };
+    var state = State{ .env = env, .local = local };
+
+    const driver = try local.exec(
+        \\(function(kill, pump, resumed) {
+        \\  Promise.resolve().then(function(){ kill(); for(;;){} });
+        \\  pump();
+        \\  resumed();
+        \\})
+    , null);
+    const driver_fn = Function{ .local = local, .handle = @ptrCast(driver.handle) };
+
+    var caught: js.TryCatch.Caught = .{};
+    const args = .{
+        local.newCallback(State.kill, &state),
+        local.newCallback(State.pump, &state),
+        local.newCallback(State.markResumed, &state),
+    };
+    try testing.expectError(error.ExecutionTerminated, driver_fn.tryCall(void, args, &caught));
+    try testing.expectEqual(false, state.resumed);
+    try testing.expectEqual(true, env.terminatePending());
+}
+
+test "Function: a terminated checkpoint stops the context loop" {
+    const frame = try testing.createFrame();
+    const other = try testing.createFrame();
+    defer testing.test_session.closeAllPages();
+
+    var ls: js.Local.Scope = undefined;
+    frame.js.localScope(&ls);
+    defer ls.deinit();
+    const local = &ls.local;
+
+    const env = frame.js.env;
+    defer env.cancelTerminate();
+
+    // The second context's queue is the one the loop must not go on to reach:
+    // entering a checkpoint on a terminating isolate consumes the termination,
+    // which would let the wedged caller below resume.
+    {
+        var other_ls: js.Local.Scope = undefined;
+        other.js.localScope(&other_ls);
+        defer other_ls.deinit();
+        try other_ls.local.eval(
+            \\window.__ran = false;
+            \\Promise.resolve().then(function(){ window.__ran = true; });
+        , null);
+    }
+
+    const State = struct {
+        env: *js.Env,
+        local: *const js.Local,
+        resumed: bool = false,
+
+        fn kill(self: *@This()) void {
+            self.env.requestTerminate();
+        }
+
+        fn pump(self: *@This()) void {
+            self.local.runMicrotasks();
+        }
+
+        fn markResumed(self: *@This()) void {
+            self.resumed = true;
+        }
+    };
+    var state = State{ .env = env, .local = local };
+
+    const driver = try local.exec(
+        \\(function(kill, pump, resumed) {
+        \\  Promise.resolve().then(function(){ kill(); for(;;){} });
+        \\  pump();
+        \\  resumed();
+        \\})
+    , null);
+    const driver_fn = Function{ .local = local, .handle = @ptrCast(driver.handle) };
+
+    var caught: js.TryCatch.Caught = .{};
+    const args = .{
+        local.newCallback(State.kill, &state),
+        local.newCallback(State.pump, &state),
+        local.newCallback(State.markResumed, &state),
+    };
+    try testing.expectError(error.ExecutionTerminated, driver_fn.tryCall(void, args, &caught));
+    try testing.expectEqual(false, state.resumed);
+
+    env.cancelTerminate();
+    var other_ls: js.Local.Scope = undefined;
+    other.js.localScope(&other_ls);
+    defer other_ls.deinit();
+    try testing.expectEqual(false, (try other_ls.local.exec("window.__ran", null)).toBool());
 }
 
 // A cheap, copyable handle to a persisted function. See js.GlobalSlot.

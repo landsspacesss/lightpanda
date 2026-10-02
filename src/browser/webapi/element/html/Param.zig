@@ -1,7 +1,6 @@
 const lp = @import("lightpanda");
 const Factory = @import("../../../Factory.zig");
 const js = @import("../../../js/js.zig");
-const Frame = @import("../../../Frame.zig");
 const Node = @import("../../Node.zig");
 const Element = @import("../../Element.zig");
 const HtmlElement = @import("../Html.zig");
@@ -20,22 +19,6 @@ pub fn asNode(self: *Param) *Node {
     return self.asElement().asNode();
 }
 
-pub fn getName(self: *Param) []const u8 {
-    return self.asElement().getAttributeSafe(comptime .wrap("name")) orelse "";
-}
-
-pub fn setName(self: *Param, value: []const u8, frame: *Frame) !void {
-    try self.asElement().setAttributeSafe(comptime .wrap("name"), .wrap(value), frame);
-}
-
-pub fn getValue(self: *Param) []const u8 {
-    return self.asElement().getAttributeSafe(comptime .wrap("value")) orelse "";
-}
-
-pub fn setValue(self: *Param, value: []const u8, frame: *Frame) !void {
-    try self.asElement().setAttributeSafe(comptime .wrap("value"), .wrap(value), frame);
-}
-
 pub const JsApi = struct {
     pub const bridge = js.Bridge(Param);
 
@@ -45,8 +28,12 @@ pub const JsApi = struct {
         pub var class_id: bridge.ClassId = undefined;
     };
 
-    pub const name = bridge.accessor(Param.getName, Param.setName, .{ .ce_reactions = true });
-    pub const value = bridge.accessor(Param.getValue, Param.setValue, .{ .ce_reactions = true });
+    const reflect = Element.Reflect(Param);
+    pub const valueType = reflect.string("valuetype");
+    pub const @"type" = reflect.string("type");
+
+    pub const name = reflect.string("name");
+    pub const value = reflect.string("value");
 };
 
 const testing = @import("../../../../testing.zig");

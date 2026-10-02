@@ -20,10 +20,12 @@ const std = @import("std");
 const lp = @import("lightpanda");
 
 const App = @import("../App.zig");
+const Config = @import("../Config.zig");
 
 const History = @import("webapi/History.zig");
 const storage = @import("webapi/storage/storage.zig");
 const IdbManager = @import("webapi/storage/idb/idb.zig").Manager;
+const CacheStore = @import("webapi/cache/Store.zig");
 const Factory = @import("Factory.zig");
 const EventTarget = @import("webapi/EventTarget.zig");
 const Navigation = @import("webapi/navigation/Navigation.zig");
@@ -35,6 +37,7 @@ pub const Runner = @import("Runner.zig");
 const Notification = @import("../Notification.zig");
 const QueuedNavigation = Frame.QueuedNavigation;
 const SharedWorkerGlobalScope = @import("webapi/SharedWorkerGlobalScope.zig");
+const ServiceWorkerGlobalScope = @import("webapi/ServiceWorkerGlobalScope.zig");
 
 const log = lp.log;
 const ArenaPool = App.ArenaPool;
@@ -51,8 +54,8 @@ arena: *lp.Arena,
 history: History,
 navigation: *Navigation,
 storage_shed: storage.Shed,
-// Per-origin IndexedDB engines
-idb: IdbManager,
+idb: IdbManager, // Per-origin IndexedDB engines
+cache_store: CacheStore, // Per-origin CacheStorage
 // Backs `globalThis.lp.*`; values pre-stringified so the prelude splices
 // them in without re-encoding.
 bridge_store: std.StringHashMapUnmanaged([]const u8) = .empty,
@@ -73,6 +76,10 @@ pages: std.ArrayList(*Page) = .empty,
 // Owned by the Page that creates it.
 shared_workers: std.StringHashMapUnmanaged(*SharedWorkerGlobalScope) = .empty,
 
+// url => SWGS. The SWGS is owned by the page, but can be shared with other
+// pages by url.
+service_workers: std.StringHashMapUnmanaged(*ServiceWorkerGlobalScope) = .empty,
+
 _page_destruction_queue: std.ArrayList(*Page) = .empty,
 
 // Round-robin cursor for fair page iteration (processQueuedNavigation)
@@ -85,20 +92,15 @@ _nav_cursor: usize = 0,
 // `commitPendingPage`).
 _tool_frame_override: ?u32 = null,
 
+// A popup the last tool action opened (target=_blank). Tools act on it, as
+// a user whose click opened a tab would, until it goes away.
+_followed_popup: ?u32 = null,
+
 // Loader IDs are scoped to the Session: each new BrowserContext gets a
 // fresh counter. Frame IDs (`frame_id_gen`) live on `Browser` instead so
 // CDP target IDs stay unique across BrowserContext lifecycle on a single
 // connection (see `Browser.frame_id_gen` and issue #2472).
 loader_id_gen: u32 = 0,
-
-// configuration (or CDP command) to disable iframe loading
-subframe_loading_enabled: bool = true,
-
-// configuration (or CDP command) to disable Web Worker loading. When false,
-// `new Worker(url)` returns a Worker object whose script is never fetched
-// and never evaluated. Set from the `--disable-workers` CLI flag at
-// session init; the LP.configureLoading CDP method can flip it per-session.
-worker_loading_enabled: bool = true,
 
 // Console.* capture for the `consoleLogs` tool, capped at `max_console_bytes`.
 // Opt-in via `enableConsoleCapture`: plain CDP `serve` never drains it, so
@@ -106,14 +108,11 @@ worker_loading_enabled: bool = true,
 _console_messages: std.Io.Writer.Allocating,
 _console_capture: bool = false,
 
-// Opt-in fetch of external <link rel=stylesheet> resources. Defaults to
-// false to preserve the current rendering-free fast path: drivers that
-// don't need accurate visibility checks pay nothing. Set from the
-// `--enable-external-stylesheets` CLI flag at session init; the
-// LP.configureLoading CDP method can flip it per-session. When true,
-// `Link.linkAddedCallback` routes to `Frame.loadExternalStylesheet`
-// (synchronous fetch + parse + register on `document.styleSheets`).
-load_external_stylesheets: bool = false,
+// configured external resources (images, stylesheet, worker, iframe) to load
+load_resources: Config.LoadResources,
+
+// opt-in unstable features (--experimental-features)
+experimental_features: Config.ExperimentalFeatures,
 
 /// Caller-supplied cancellation probe. `Runner._wait` polls it between
 /// ticks; once `check` returns true the wait returns `error.Cancelled`.
@@ -141,7 +140,7 @@ pub const DownloadBehavior = enum {
     deny,
 };
 
-pub const CancelHook = struct {
+const CancelHook = struct {
     context: *anyopaque,
     check: *const fn (*anyopaque) bool,
 };
@@ -161,10 +160,9 @@ pub fn init(self: *Session, browser: *Browser, notification: *Notification) !voi
     errdefer arena.release();
 
     const navigation = try Factory.chainedWithAllocator(arena.allocator(), .{
-        EventTarget{ ._type = undefined },
+        EventTarget{ ._type = .navigation },
         Navigation{ ._proto = undefined },
     });
-    navigation._proto._type = .{ .navigation = navigation };
 
     self.* = .{
         .arena = arena,
@@ -173,14 +171,13 @@ pub fn init(self: *Session, browser: *Browser, notification: *Notification) !voi
         .navigation = navigation,
         .storage_shed = .{},
         .idb = IdbManager.init(allocator),
+        .cache_store = CacheStore.init(allocator),
         .browser = browser,
         .notification = notification,
         .cookie_jar = storage.Cookie.Jar.init(allocator, notification),
-        // CLI defaults; LP.configureLoading can flip these per-session.
-        .subframe_loading_enabled = !browser.app.config.disableSubframes(),
-        .worker_loading_enabled = !browser.app.config.disableWorkers(),
         ._console_messages = .init(allocator),
-        .load_external_stylesheets = browser.app.config.enableExternalStylesheets(),
+        .load_resources = browser.app.config.loadResources(),
+        .experimental_features = browser.app.config.experimentalFeatures(),
     };
     errdefer self._console_messages.deinit();
 }
@@ -192,12 +189,33 @@ pub fn deinit(self: *Session) void {
 
     self.closeAllPages();
 
+    // CorsGate/RobotsGate fetches are ownerless, so page/frame teardown above
+    // never reaches them.
+    //
+    // They still carry this notification and can outlive it, so clear the pointer here or
+    // Transfer.kill's later notify() dispatches through a freed Notification
+    // once the caller runs notification.deinit() after this returns.
+    var transfer_it = self.browser.http_client.transfers.valueIterator();
+    while (transfer_it.next()) |t| {
+        if (t.*.req.notification == self.notification) {
+            t.*.req.notification = null;
+        }
+    }
+
     self.cookie_jar.deinit();
 
-    self.browser.env.memoryPressureNotification(.critical);
+    {
+        // Every context is disposed; this GC must not arm a termination.
+        const env = &self.browser.env;
+        const was_tearing_down = env.tearing_down;
+        env.tearing_down = true;
+        defer env.tearing_down = was_tearing_down;
+        env.memoryPressureNotification(.critical);
+    }
 
     self.storage_shed.deinit(self.browser.app.allocator);
     self.idb.deinit();
+    self.cache_store.deinit();
     {
         const allocator = self.browser.app.allocator;
         var it = self.bridge_store.iterator();
@@ -258,6 +276,9 @@ pub fn processDestroyQueues(self: *Session) void {
         const queue = self._page_destruction_queue.items;
         if (queue.len > 0) {
             for (queue) |page| {
+                if (comptime lp.IS_DEBUG) {
+                    std.debug.assert(log.currentPage() != &page.log_context);
+                }
                 page.deinit();
                 self.browser.page_pool.destroy(page);
             }
@@ -342,8 +363,8 @@ fn tearDownPage(self: *Session, page: *Page) void {
 }
 
 // Allocate a Page in a free slot, publish it as the active page, and
-// dispatch `frame_created` so CDP creates fresh isolated-world V8
-// contexts. Used by createPage and by the synthetic-nav path. Does NOT
+// dispatch `frame_created` so CDP can bind its page handle to the new
+// frame. Used by createPage and by the synthetic-nav path. Does NOT
 // dispatch `frame_navigate` — the caller does that (or doesn't, for a
 // blank initial page).
 //
@@ -358,8 +379,8 @@ fn installNewActivePage(self: *Session, frame_id: u32) !*Frame {
     errdefer _ = self.pages.pop();
 
     const frame = &page.frame;
-    // Inform CDP the main frame has been created such that additional
-    // context for other Worlds can be created as well.
+    // Inform CDP the main frame has been created so it can point its page
+    // handle at the new frame.
     self.notification.dispatch(.frame_created, frame);
     return frame;
 }
@@ -373,7 +394,20 @@ pub fn createPage(self: *Session) !PageHandle {
     }
 
     const frame_id = self.nextFrameId();
-    _ = try self.installNewActivePage(frame_id);
+    const frame = try self.installNewActivePage(frame_id);
+
+    // https://html.spec.whatwg.org/multipage/document-sequences.html --
+    // Creating a new browsing context always produces an initial about:blank
+    // Document with its own session history entry, even before any real
+    // navigation happens. Without this, navigation.currentEntry crashes on
+    // a page that hasn't navigated yet.
+    _ = try self.navigation.pushEntry(
+        frame.url,
+        .{ .source = .navigation, .value = null },
+        frame,
+        false,
+    );
+    self.navigation._initial_entry = true;
 
     return .{ .session = self, .frame_id = frame_id };
 }
@@ -413,7 +447,14 @@ pub fn getPinnedArena(self: *Session, size_or_bucket: anytype, debug: []const u8
     return self.arena_pool.acquirePinned(&self.browser.arena_account, size_or_bucket, debug);
 }
 
-// The live page for a top-level browsing context, by its root frame id.
+pub fn stopLoading(self: *Session, frame_id: u32) void {
+    const live = self.livePage(frame_id) orelse return;
+    if (self.replacementOf(live)) |pending| {
+        pending.frame.stopLoading();
+    }
+    live.frame.stopLoading();
+}
+
 pub fn livePage(self: *Session, frame_id: u32) ?*Page {
     for (self.pages.items) |page| {
         if (page.frame._frame_id == frame_id) {
@@ -475,6 +516,12 @@ pub fn currentFrame(self: *Session) ?*Frame {
         // No pages[0] fallthrough: the override targets one specific page.
         return self.findFrameByFrameId(frame_id);
     }
+    if (self._followed_popup) |frame_id| {
+        if (self.findFrameByFrameId(frame_id)) |frame| {
+            return frame;
+        }
+        self._followed_popup = null;
+    }
     if (self.pages.items.len == 0) {
         return null;
     }
@@ -488,6 +535,11 @@ pub fn currentFrame(self: *Session) ?*Frame {
 /// See `_tool_frame_override`. Pass null to clear.
 pub fn setToolFrameOverride(self: *Session, frame_id: ?u32) void {
     self._tool_frame_override = frame_id;
+}
+
+/// See `_followed_popup`.
+pub fn followPopup(self: *Session, frame_id: u32) void {
+    self._followed_popup = frame_id;
 }
 
 // Multi-page aware: frame ids are globally unique (monotonic on `Browser`).
@@ -532,7 +584,7 @@ pub fn idleSlice(self: *Session) u31 {
 }
 
 pub fn scheduleNavigation(_: *Session, frame: *Frame) !void {
-    return frame._page.scheduleNavigation(frame);
+    return frame.page.scheduleNavigation(frame);
 }
 
 // Drain one page's queued navigations and return whether any page had work.
@@ -598,8 +650,8 @@ fn processPageQueuedNavigation(self: *Session, page: *Page) !void {
             continue;
         };
 
-        if (qn.is_about_blank) {
-            // Defer about:blank to second pass
+        if (qn.is_about_something) {
+            // Defer about:blank or about:srcdoc to second pass
             try about_blank_queue.append(self.arena.allocator(), frame);
             continue;
         }
@@ -625,7 +677,7 @@ fn processPageQueuedNavigation(self: *Session, page: *Page) !void {
             continue;
         };
         self.processFrameNavigation(frame, qn) catch |err| {
-            log.warn(.frame, "frame navigation", .{ .url = qn.url, .err = err });
+            log.debug(.frame, "frame navigation", .{ .url = qn.url, .err = err });
         };
     }
 
@@ -637,8 +689,8 @@ fn processPageQueuedNavigation(self: *Session, page: *Page) !void {
     while (i < new_navigations.items.len) {
         const frame = new_navigations.items[i];
         if (frame._queued_navigation) |qn| {
-            if (qn.is_about_blank) {
-                log.warn(.frame, "recursive about blank", .{});
+            if (qn.is_about_something) {
+                log.debug(.frame, "recursive about blank", .{});
                 _ = page.queued_navigation.swapRemove(i);
                 continue;
             }
@@ -661,7 +713,7 @@ fn processFrameNavigation(self: *Session, frame: *Frame, qn: *QueuedNavigation) 
     }
 
     self._processFrameNavigation(frame, qn) catch |err| {
-        log.warn(.frame, "frame navigation", .{ .url = qn.url, .err = err });
+        log.debug(.frame, "frame navigation", .{ .url = qn.url, .err = err });
         return err;
     };
 }
@@ -693,8 +745,7 @@ fn _processFrameNavigation(self: *Session, frame: *Frame, qn: *QueuedNavigation)
 
     const frame_id = frame._frame_id;
     const reuse_window = frame.window;
-    const page = frame._page;
-    frame.js.detachGlobal();
+    const page = frame.page;
     frame.deinit();
     frame.* = undefined;
 
@@ -727,7 +778,7 @@ fn _processFrameNavigation(self: *Session, frame: *Frame, qn: *QueuedNavigation)
     iframe._window = frame.window;
 
     frame.navigate(qn.url, qn.opts) catch |err| {
-        log.err(.browser, "queued frame navigation error", .{ .err = err });
+        log.debug(.browser, "queued frame navigation error", .{ .err = err });
         return err;
     };
 }
@@ -743,9 +794,8 @@ fn processPopupNavigation(_: *Session, frame: *Frame, qn: *QueuedNavigation) !vo
     const saved_name = reuse_window._name;
     const saved_opener = reuse_window._opener;
     const frame_id = frame._frame_id;
-    const page = frame._page;
+    const page = frame.page;
 
-    frame.js.detachGlobal();
     frame.deinit();
     frame.* = undefined;
 
@@ -766,7 +816,7 @@ fn processPopupNavigation(_: *Session, frame: *Frame, qn: *QueuedNavigation) !vo
     frame.window._opener = saved_opener;
 
     frame.navigate(qn.url, qn.opts) catch |err| {
-        log.err(.browser, "queued popup navigation error", .{ .err = err });
+        log.debug(.browser, "queued popup navigation error", .{ .err = err });
         return err;
     };
 }
@@ -783,7 +833,7 @@ fn processRootQueuedNavigation(self: *Session, page: *Page) !void {
     // Synthetic navigations (about:blank, blob:) commit instantly — no HTTP,
     // so there is no in-flight window to worry about. Use the optimized
     // immediate-swap path for them.
-    const is_synthetic = qn.is_about_blank or std.mem.startsWith(u8, qn.url, "blob:");
+    const is_synthetic = qn.is_about_something or std.mem.startsWith(u8, qn.url, "blob:");
 
     // The qn arena is consumed here regardless of success — frame.navigate
     // dupes the URL into the page's own arena, so we can release the qn
@@ -811,7 +861,7 @@ fn replaceRootImmediate(self: *Session, frame_id: u32, url: [:0]const u8, opts: 
     const new_frame = try self.installNewActivePage(frame_id);
 
     new_frame.navigate(url, opts) catch |err| {
-        log.err(.browser, "synthetic navigation error", .{ .err = err, .url = url });
+        log.debug(.browser, "synthetic navigation error", .{ .err = err, .url = url });
         return err;
     };
 }
@@ -864,9 +914,12 @@ pub fn initiateRootNavigation(self: *Session, frame_id: u32, url: [:0]const u8, 
     // commit, after frame_remove tears down the OLD page's context group.
 
     page.frame.navigate(url, opts) catch |err| {
-        log.err(.browser, "pending navigation start", .{ .err = err, .url = url });
+        log.debug(.browser, "pending navigation start", .{ .err = err, .url = url });
         return err;
     };
+
+    live.frame.abortDocumentLoad();
+    live.frame.abortedDocumentIsComplete();
 }
 
 // Promote a pending replacement Page to be the live Page.
@@ -879,12 +932,14 @@ pub fn initiateRootNavigation(self: *Session, frame_id: u32, url: [:0]const u8, 
 //      isolated world contexts plus the node_registry. OLD is still the live
 //      page and its memory is alive (intentional: CDP teardown can walk
 //      old-page state without UAF).
-//   2. frame_created dispatch — CDP creates fresh isolated world contexts
-//      against the new frame. `replacement.replaces` is still set, so the
-//      session still reports an in-flight nav and CDP's frameCreated skips
-//      its frame_arena reset and captured_responses zeroing (the captured
-//      response for the request we are committing was just inserted by
-//      onHttpResponseHeadersDone moments earlier and must survive).
+//   2. frame_created dispatch — CDP rebinds its page handle to the new
+//      frame. `replacement.replaces` is still set, so the session still
+//      reports an in-flight nav and CDP's frameCreated skips its frame_arena
+//      reset and captured_responses zeroing (the captured response for the
+//      request we are committing was just inserted by
+//      onHttpResponseHeadersDone moments earlier and must survive). The
+//      isolated worlds emptied in step 1 are NOT refilled here — CDP rebuilds
+//      their contexts on the frame_navigate the caller dispatches afterwards.
 //   3. Promote: clear `replaces` and unlink OLD from `pages`, so
 //      `currentFrame()` / `livePage()` now resolve to `replacement`. Done AFTER
 //      step 2 so the in-commit signal (replaces != null) survives the dispatch
@@ -1015,4 +1070,32 @@ test "Session: retiring a pending page destroys it once" {
 
     // Would deinit `pending` twice if it had been queued twice.
     session.processDestroyQueues();
+}
+
+test "Session: console capture runs no page JS" {
+    const js = @import("js/js.zig");
+
+    const session = testing.test_session;
+    try session.enableConsoleCapture();
+    defer {
+        session.notification.unregister(.console_message, session);
+        session._console_capture = false;
+        session._console_messages.clearRetainingCapacity();
+    }
+
+    const frame = try testing.createFrame();
+    defer session.closeAllPages();
+
+    var ls: js.Local.Scope = undefined;
+    frame.js.localScope(&ls);
+    defer ls.deinit();
+    _ = try ls.local.exec(
+        \\globalThis.probed = 0;
+        \\const probe = { toString() { globalThis.probed++; console.log('inner'); return 'outer'; } };
+        \\console.log('head', probe, 10n, Symbol('s'));
+    , null);
+
+    try testing.expectEqualSlices(u8, "[log] head [object Object] 10n Symbol(s)\n", session.drainConsoleMessages());
+    const probed = try ls.local.exec("globalThis.probed", null);
+    try testing.expectEqual(0, try probed.toF64());
 }

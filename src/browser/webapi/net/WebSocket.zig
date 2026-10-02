@@ -101,7 +101,7 @@ _on_message: ?js.Function.Global = null,
 _on_error: ?js.Function.Global = null,
 _on_close: ?js.Function.Global = null,
 
-pub const ReadyState = enum(u8) {
+const ReadyState = enum(u8) {
     connecting = 0,
     open = 1,
     closing = 2,
@@ -131,7 +131,7 @@ const RecvEvent = union(enum) {
     };
 };
 
-pub const BinaryType = enum {
+const BinaryType = enum {
     blob,
     arraybuffer,
 };
@@ -240,7 +240,6 @@ fn connect(self: *WebSocket, protocols: [][]const u8) !void {
     for (http_client.baselineHeaders()) |hdr| {
         try conn.addHeader(allocator, hdr.name, hdr.value);
     }
-
     if (protocols.len > 0) {
         try conn.addHeader(allocator, "Sec-WebSocket-Protocol", try std.mem.join(allocator, ", ", protocols));
     }
@@ -259,8 +258,8 @@ fn connect(self: *WebSocket, protocols: [][]const u8) !void {
         var buf: std.Io.Writer.Allocating = .init(allocator);
         try exec.session.cookie_jar.forRequest(resolved_url, &buf.writer, .{
             .is_http = true,
-            .is_navigation = false,
-            .origin_url = exec.url.*,
+            .kind = .subresource,
+            .origin_url = exec.siteForCookies(),
         });
         if (buf.written().len > 0) {
             try buf.writer.writeByte(0);
@@ -340,7 +339,7 @@ pub fn kill(self: *WebSocket) void {
 pub fn transportClosed(self: *WebSocket, err: ?anyerror) void {
     self.releaseTransport();
     self.bufferEvent(.{ .disconnected = err }) catch |err2| {
-        log.err(.websocket, "close failure", .{ .err = err2 });
+        log.debug(.websocket, "close failure", .{ .err = err2 });
         // Can't buffer. Drop the socket without running JS.
         self.kill();
     };
@@ -356,6 +355,9 @@ pub fn deliverEvents(self: *WebSocket) void {
     // alive even when a terminal event releases the base reference.
     defer self.releaseRef(self._exec.page);
 
+    const page_scope = self._exec.page.logScope();
+    defer page_scope.exit();
+
     self._delivering = true;
     defer self._delivering = false;
 
@@ -369,7 +371,7 @@ pub fn deliverEvents(self: *WebSocket) void {
             .open => {
                 self._ready_state = .open;
                 self.dispatchOpenEvent() catch |err| {
-                    log.err(.websocket, "open event fail", .{ .err = err });
+                    log.debug(.websocket, "open event fail", .{ .err = err });
                 };
             },
             .message => |msg| {
@@ -377,14 +379,14 @@ pub fn deliverEvents(self: *WebSocket) void {
                 // events after that
                 if (self._ready_state == .open) {
                     self.dispatchMessageEvent(msg.data, msg.frame_type) catch |err| {
-                        log.err(.websocket, "message event dispatch failed", .{ .err = err });
+                        log.debug(.websocket, "message event dispatch failed", .{ .err = err });
                     };
                 }
             },
             .close_frame => self.handleCloseFrame(),
             .local_close => {
                 self.dispatchCloseEvent(self._close_code, self._close_reason, false) catch |err| {
-                    log.err(.websocket, "close event dispatch failed", .{ .err = err });
+                    log.debug(.websocket, "close event dispatch failed", .{ .err = err });
                 };
                 self.deactivate();
             },
@@ -408,7 +410,7 @@ fn handleCloseFrame(self: *WebSocket) void {
     // (.disconnected follows).
     self._ready_state = .closing;
     self.queueMessage(.close) catch |err| {
-        log.err(.websocket, "reciprocal close", .{ .err = err, .url = self._url });
+        log.debug(.websocket, "reciprocal close", .{ .err = err, .url = self._url });
     };
 }
 
@@ -417,7 +419,7 @@ fn disconnected(self: *WebSocket, err_: ?anyerror) void {
     self._ready_state = .closed;
 
     if (err_) |err| {
-        log.warn(.websocket, "disconnected", .{ .err = err, .url = self._url });
+        log.debug(.websocket, "disconnected", .{ .err = err, .url = self._url });
     } else {
         log.info(.websocket, "disconnected", .{ .url = self._url, .reason = "closed" });
     }
@@ -431,12 +433,12 @@ fn disconnected(self: *WebSocket, err_: ?anyerror) void {
     // Spec requires error event before close on abnormal closure.
     if (!was_clean) {
         self.dispatchErrorEvent() catch |err| {
-            log.err(.websocket, "error event dispatch failed", .{ .err = err });
+            log.debug(.websocket, "error event dispatch failed", .{ .err = err });
         };
     }
 
     self.dispatchCloseEvent(code, reason, was_clean) catch |err| {
-        log.err(.websocket, "close event dispatch failed", .{ .err = err });
+        log.debug(.websocket, "close event dispatch failed", .{ .err = err });
     };
 }
 
@@ -523,7 +525,12 @@ fn queueMessage(self: *WebSocket, msg: Message) !void {
     if (was_empty) {
         // Unpause the send callback so libcurl will request data
         if (self._conn) |conn| {
-            try conn.pause(.{ .cont = true });
+            conn.pause(.{ .cont = true }) catch |err| {
+                // our caller is doing `errdefer errdefer arena.release();` which
+                // will free msg. So we have to pop it out.
+                _ = self._send_queue.pop();
+                return err;
+            };
         }
     }
 }
@@ -651,11 +658,11 @@ pub fn getUrl(self: *const WebSocket) []const u8 {
     return self._url;
 }
 
-pub fn getReadyState(self: *const WebSocket) u16 {
+fn getReadyState(self: *const WebSocket) u16 {
     return @intFromEnum(self._ready_state);
 }
 
-pub fn getBufferedAmount(self: *const WebSocket) u32 {
+fn getBufferedAmount(self: *const WebSocket) u32 {
     var buffered: u32 = 0;
     for (self._send_queue.items) |msg| {
         switch (msg) {
@@ -666,7 +673,7 @@ pub fn getBufferedAmount(self: *const WebSocket) u32 {
     return buffered;
 }
 
-pub fn getBinaryType(self: *const WebSocket) []const u8 {
+fn getBinaryType(self: *const WebSocket) []const u8 {
     return @tagName(self._binary_type);
 }
 
@@ -674,17 +681,17 @@ pub fn getProtocol(self: *const WebSocket) []const u8 {
     return self._protocol;
 }
 
-pub fn setBinaryType(self: *WebSocket, value: []const u8) void {
+fn setBinaryType(self: *WebSocket, value: []const u8) void {
     if (std.meta.stringToEnum(BinaryType, value)) |bt| {
         self._binary_type = bt;
     }
 }
 
-pub fn getOnOpen(self: *const WebSocket) ?js.Function.Global {
+fn getOnOpen(self: *const WebSocket) ?js.Function.Global {
     return self._on_open;
 }
 
-pub fn setOnOpen(self: *WebSocket, cb_: ?js.Function) !void {
+fn setOnOpen(self: *WebSocket, cb_: ?js.Function) !void {
     if (self._on_open) |old| old.release();
     if (cb_) |cb| {
         self._on_open = try cb.persistWithThis(self);
@@ -693,11 +700,11 @@ pub fn setOnOpen(self: *WebSocket, cb_: ?js.Function) !void {
     }
 }
 
-pub fn getOnMessage(self: *const WebSocket) ?js.Function.Global {
+fn getOnMessage(self: *const WebSocket) ?js.Function.Global {
     return self._on_message;
 }
 
-pub fn setOnMessage(self: *WebSocket, cb_: ?js.Function) !void {
+fn setOnMessage(self: *WebSocket, cb_: ?js.Function) !void {
     if (self._on_message) |old| old.release();
     if (cb_) |cb| {
         self._on_message = try cb.persistWithThis(self);
@@ -706,11 +713,11 @@ pub fn setOnMessage(self: *WebSocket, cb_: ?js.Function) !void {
     }
 }
 
-pub fn getOnError(self: *const WebSocket) ?js.Function.Global {
+fn getOnError(self: *const WebSocket) ?js.Function.Global {
     return self._on_error;
 }
 
-pub fn setOnError(self: *WebSocket, cb_: ?js.Function) !void {
+fn setOnError(self: *WebSocket, cb_: ?js.Function) !void {
     if (self._on_error) |old| old.release();
     if (cb_) |cb| {
         self._on_error = try cb.persistWithThis(self);
@@ -719,11 +726,11 @@ pub fn setOnError(self: *WebSocket, cb_: ?js.Function) !void {
     }
 }
 
-pub fn getOnClose(self: *const WebSocket) ?js.Function.Global {
+fn getOnClose(self: *const WebSocket) ?js.Function.Global {
     return self._on_close;
 }
 
-pub fn setOnClose(self: *WebSocket, cb_: ?js.Function) !void {
+fn setOnClose(self: *WebSocket, cb_: ?js.Function) !void {
     if (self._on_close) |old| old.release();
     if (cb_) |cb| {
         self._on_close = try cb.persistWithThis(self);
@@ -797,13 +804,13 @@ fn sendDataCallback(buffer: [*]u8, buf_count: usize, buf_len: usize, data: *anyo
     }
     const conn: *http.Connection = @ptrCast(@alignCast(data));
     return _sendDataCallback(conn, buffer[0..buf_len]) catch |err| {
-        log.warn(.websocket, "send callback", .{ .err = err });
+        log.debug(.websocket, "send callback", .{ .err = err });
         return http.readfunc_pause;
     };
 }
 
 fn _sendDataCallback(conn: *http.Connection, buf: []u8) !usize {
-    lp.assert(buf.len >= 2, "WS short buffer", .{ .len = buf.len });
+    lp.assert(buf.len > 0, "WS short buffer", .{ .len = buf.len });
 
     const self = conn.transport.websocket;
 
@@ -820,22 +827,29 @@ fn _sendDataCallback(conn: *http.Connection, buf: []u8) !usize {
             const reason = self._close_reason;
 
             // Close frame: 2 bytes for code (big-endian) + optional reason
-            // Truncate reason to fit in buf (max 123 bytes per spec)
-            const reason_len: usize = @min(reason.len, 123, buf.len -| 2);
-            const frame_len = 2 + reason_len;
-            const to_copy = @min(buf.len, frame_len);
-
+            // (max 123 bytes per spec)
+            const reason_len: usize = @min(reason.len, 123);
             var close_payload: [125]u8 = undefined;
             close_payload[0] = @intCast((code >> 8) & 0xFF);
             close_payload[1] = @intCast(code & 0xFF);
             if (reason_len > 0) {
                 @memcpy(close_payload[2..][0..reason_len], reason[0..reason_len]);
             }
+            const payload = close_payload[0 .. 2 + reason_len];
 
-            try conn.wsStartFrame(.close, to_copy);
-            @memcpy(buf[0..to_copy], close_payload[0..to_copy]);
+            if (self._send_offset == 0) {
+                try conn.wsStartFrame(.close, payload.len);
+            }
 
-            _ = self._send_queue.orderedRemove(0);
+            const remaining = payload[self._send_offset..];
+            const to_copy = @min(remaining.len, buf.len);
+            @memcpy(buf[0..to_copy], remaining[0..to_copy]);
+
+            self._send_offset += to_copy;
+            if (self._send_offset == payload.len) {
+                _ = self._send_queue.orderedRemove(0);
+                self._send_offset = 0;
+            }
             return to_copy;
         },
         .text => |content| return self.writeContent(conn, buf, content, .text),
@@ -876,7 +890,7 @@ fn receivedDataCallback(buffer: [*]const u8, buf_count: usize, buf_len: usize, d
     }
     const conn: *http.Connection = @ptrCast(@alignCast(data));
     _receivedDataCallback(conn, buffer[0..buf_len]) catch |err| {
-        log.warn(.websocket, "receive callback", .{ .err = err });
+        log.debug(.websocket, "receive callback", .{ .err = err });
         // TODO: are there errors, like an invalid frame, that we shouldn't treat
         // as an error?
         return http.writefunc_error;
@@ -1041,10 +1055,38 @@ pub const JsApi = struct {
 
 const testing = @import("../../../testing.zig");
 test "WebApi: WebSocket" {
-    testing.expectLog(&.{.websocket});
     try testing.htmlRunner("net/websocket.html", .{});
 }
 
 test "WebApi: WebSocket in worker" {
     try testing.htmlRunner("net/websocket_worker.html", .{});
+}
+
+// Production crash (release overflow on unrelated pooled objects): send()
+// released the message arena on a failed unpause while the message stayed in
+// _send_queue, which released it again later — a pooled-arena double release.
+test "WebApi: WebSocket send owns its message arena once when the unpause fails" {
+    const frame = try testing.createFrame();
+    defer testing.test_session.closeAllPages();
+
+    var ls: js.Local.Scope = undefined;
+    frame.js.localScope(&ls);
+    defer ls.deinit();
+
+    var protocols: [0][]const u8 = .{};
+    const ws = try WebSocket.init("ws://127.0.0.1:9582/ws", &protocols, &frame.js.execution);
+    try testing.expect(ws._conn != null);
+
+    // connect() tracked the easy handle but no tick has performed it, so
+    // libcurl has no connection behind it and curl_easy_pause fails: the
+    // same state as a send() on a socket the peer already closed, before
+    // the close has been dispatched.
+    ws._ready_state = .open;
+
+    const message = try ls.local.exec("'hello'", null);
+    try testing.expectError(error.BadFunctionArgument, ws.send(.{ .js_val = message }));
+
+    // The queued message owns the arena. A failed send must not leave it
+    // queued with its arena already released.
+    try testing.expectEqual(0, ws._send_queue.items.len);
 }

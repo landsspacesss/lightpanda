@@ -43,7 +43,7 @@ pub fn evaluate(
     _: *const XPathEvaluator,
     expression: []const u8,
     context_node: *Node,
-    resolver: ?js.Function,
+    resolver: ?js.Value,
     requested_type: ?u16,
     result: ?*XPathResult,
     frame: *Frame,
@@ -56,17 +56,17 @@ pub fn evaluate(
     return XPathResult.fromExpression(expression, context_node, requested_type orelse XPathResult.ANY_TYPE, frame);
 }
 
-pub fn createExpression(
+fn createExpression(
     _: *const XPathEvaluator,
     expression: []const u8,
-    resolver: ?js.Function,
+    resolver: ?js.Value,
     frame: *Frame,
 ) !*XPathExpression {
     _ = resolver;
     return XPathExpression.init(expression, frame);
 }
 
-pub fn createNSResolver(_: *const XPathEvaluator, node: *Node) ?*Node {
+fn createNSResolver(_: *const XPathEvaluator, node: *Node) ?*Node {
     // HTML-mode passthrough — the WHATWG IDL accepts a Node and returns
     // an `XPathNSResolver`, but in practice the input node is reused.
     return node;

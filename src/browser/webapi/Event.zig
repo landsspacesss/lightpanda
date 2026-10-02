@@ -21,6 +21,7 @@ const lp = @import("lightpanda");
 
 const js = @import("../js/js.zig");
 const Page = @import("../Page.zig");
+const EventManager = @import("../EventManager.zig");
 
 const Node = @import("Node.zig");
 const EventTarget = @import("EventTarget.zig");
@@ -35,11 +36,15 @@ _type: Type,
 _arena: *lp.Arena,
 _bubbles: bool = false,
 _cancelable: bool = false,
+// Resolved at dispatch: cancelable only while a listener on the path could
+// call preventDefault. The UA's scroll-blocking events work this way.
+_cancelable_unless_passive: bool = false,
 _composed: bool = false,
 _type_string: String,
 _target: ?*EventTarget = null,
 _current_target: ?*EventTarget = null,
 _dispatch_target: ?*EventTarget = null, // Original target for composedPath()
+_dispatch_related_target: ?*EventTarget = null,
 _prevent_default: bool = false,
 _stop_propagation: bool = false,
 _stop_immediate_propagation: bool = false,
@@ -66,7 +71,7 @@ _time_origin: u64 = 0,
 // - 2: both zig and v8 have a reference
 _rc: lp.RC = .{},
 
-pub const EventPhase = enum(u8) {
+const EventPhase = enum(u8) {
     none = 0,
     capturing_phase = 1,
     at_target = 2,
@@ -83,6 +88,7 @@ pub const Type = union(enum) {
     page_transition_event: *@import("event/PageTransitionEvent.zig"),
     pop_state_event: *@import("event/PopStateEvent.zig"),
     hash_change_event: *@import("event/HashChangeEvent.zig"),
+    media_query_list_event: *@import("event/MediaQueryListEvent.zig"),
     before_unload_event: *@import("event/BeforeUnloadEvent.zig"),
     storage_event: *@import("event/StorageEvent.zig"),
     device_motion_event: *@import("event/DeviceMotionEvent.zig"),
@@ -90,6 +96,7 @@ pub const Type = union(enum) {
     device_orientation_event: *@import("event/DeviceOrientationEvent.zig"),
     ui_event: *@import("event/UIEvent.zig"),
     promise_rejection_event: *@import("event/PromiseRejectionEvent.zig"),
+    extendable_event: *@import("event/ExtendableEvent.zig"),
     submit_event: *@import("event/SubmitEvent.zig"),
     form_data_event: *@import("event/FormDataEvent.zig"),
     close_event: *@import("event/CloseEvent.zig"),
@@ -139,7 +146,7 @@ fn initWithTrusted(arena: *lp.Arena, typ: String, opts_: ?Options, comptime trus
     return event;
 }
 
-pub fn initEvent(
+fn initEvent(
     self: *Event,
     event_string: []const u8,
     bubbles: ?bool,
@@ -198,12 +205,14 @@ pub fn is(self: *Event, comptime T: type) ?*T {
         .page_transition_event => |e| return if (T == @import("event/PageTransitionEvent.zig")) e else null,
         .pop_state_event => |e| return if (T == @import("event/PopStateEvent.zig")) e else null,
         .hash_change_event => |e| return if (T == @import("event/HashChangeEvent.zig")) e else null,
+        .media_query_list_event => |e| return if (T == @import("event/MediaQueryListEvent.zig")) e else null,
         .before_unload_event => |e| return if (T == @import("event/BeforeUnloadEvent.zig")) e else null,
         .storage_event => |e| return if (T == @import("event/StorageEvent.zig")) e else null,
         .device_motion_event => |e| return if (T == @import("event/DeviceMotionEvent.zig")) e else null,
         .gamepad_event => |e| return if (T == @import("event/GamepadEvent.zig")) e else null,
         .device_orientation_event => |e| return if (T == @import("event/DeviceOrientationEvent.zig")) e else null,
         .promise_rejection_event => |e| return if (T == @import("event/PromiseRejectionEvent.zig")) e else null,
+        .extendable_event => |e| return if (T == @import("event/ExtendableEvent.zig")) e else null,
         .submit_event => |e| return if (T == @import("event/SubmitEvent.zig")) e else null,
         .form_data_event => |e| return if (T == @import("event/FormDataEvent.zig")) e else null,
         .close_event => |e| return if (T == @import("event/CloseEvent.zig")) e else null,
@@ -225,15 +234,15 @@ pub fn getType(self: *const Event) []const u8 {
     return self._type_string.str();
 }
 
-pub fn getBubbles(self: *const Event) bool {
+fn getBubbles(self: *const Event) bool {
     return self._bubbles;
 }
 
-pub fn getCancelable(self: *const Event) bool {
+fn getCancelable(self: *const Event) bool {
     return self._cancelable;
 }
 
-pub fn getComposed(self: *const Event) bool {
+fn getComposed(self: *const Event) bool {
     return self._composed;
 }
 
@@ -241,7 +250,7 @@ pub fn getTarget(self: *const Event) ?*EventTarget {
     return self._target;
 }
 
-pub fn getCurrentTarget(self: *const Event) ?*EventTarget {
+fn getCurrentTarget(self: *const Event) ?*EventTarget {
     return self._current_target;
 }
 
@@ -251,11 +260,11 @@ pub fn preventDefault(self: *Event) void {
     }
 }
 
-pub fn stopPropagation(self: *Event) void {
+fn stopPropagation(self: *Event) void {
     self._stop_propagation = true;
 }
 
-pub fn stopImmediatePropagation(self: *Event) void {
+fn stopImmediatePropagation(self: *Event) void {
     self._stop_immediate_propagation = true;
     self._stop_propagation = true;
 }
@@ -277,19 +286,19 @@ pub fn setReturnValue(self: *Event, v: bool) void {
     }
 }
 
-pub fn getCancelBubble(self: *const Event) bool {
+fn getCancelBubble(self: *const Event) bool {
     return self._stop_propagation;
 }
 
-pub fn setCancelBubble(self: *Event) void {
+fn setCancelBubble(self: *Event) void {
     self.stopPropagation();
 }
 
-pub fn getEventPhase(self: *const Event) u8 {
+fn getEventPhase(self: *const Event) u8 {
     return @intFromEnum(self._event_phase);
 }
 
-pub fn getTimeStamp(self: *const Event, exec: *js.Execution) f64 {
+fn getTimeStamp(self: *const Event, exec: *js.Execution) f64 {
     const origin = if (self._time_origin != 0) self._time_origin else exec.performance()._time_origin;
     if (self._time_stamp <= origin) {
         return 0.0;
@@ -297,19 +306,11 @@ pub fn getTimeStamp(self: *const Event, exec: *js.Execution) f64 {
     return @as(f64, @floatFromInt(self._time_stamp - origin)) / 1000.0;
 }
 
-pub fn setTrusted(self: *Event) void {
-    self._is_trusted = true;
-}
-
-pub fn setUntrusted(self: *Event) void {
-    self._is_trusted = false;
-}
-
 pub fn getIsTrusted(self: *const Event) bool {
     return self._is_trusted;
 }
 
-pub fn composedPath(self: *Event, exec: *Execution) ![]const *EventTarget {
+fn composedPath(self: *Event, exec: *Execution) ![]const *EventTarget {
     // Return empty array if event is not being dispatched
     if (self._event_phase == .none) {
         return &.{};
@@ -320,116 +321,58 @@ pub fn composedPath(self: *Event, exec: *Execution) ![]const *EventTarget {
     const target = self._dispatch_target orelse self._target orelse return &.{};
 
     // Only nodes have a propagation path
-    const target_node = switch (target._type) {
-        .node => |n| n,
-        else => return &.{},
-    };
-
-    // Build the path by walking up from target
-    var path_len: usize = 0;
-    var path_buffer: [128]*EventTarget = undefined;
-    var stopped_at_shadow_boundary = false;
-
-    // Track closed shadow boundaries (position in path and host position)
-    var closed_shadow_boundary: ?struct { shadow_end: usize, host_start: usize } = null;
+    const target_node = target.is(Node) orelse return &.{};
 
     const frame_ = switch (exec.js.global) {
         .frame => |frame| frame,
         else => null,
     };
 
-    const target_root = target_node.getRootNode(.{});
-    var node: ?*Node = target_node;
-    while (node) |n| {
-        if (path_len >= path_buffer.len) {
-            break;
-        }
-        path_buffer[path_len] = n.asEventTarget();
-        path_len += 1;
-
-        // Check if this node is a shadow root
-        if (n._type == .document_fragment) {
-            const df = n.subtype(Node.DocumentFragment);
-            if (df._type == .shadow_root) {
-                const shadow = df._type.shadow_root;
-
-                if (!self._composed and n == target_root) {
-                    stopped_at_shadow_boundary = true;
-                    break;
-                }
-
-                // Track the first closed shadow boundary we encounter
-                if (shadow._mode == .closed and closed_shadow_boundary == null) {
-                    // Mark where the shadow root is in the path
-                    // The next element will be the host
-                    closed_shadow_boundary = .{
-                        .shadow_end = path_len - 1, // index of shadow root
-                        .host_start = path_len, // index where host will be
-                    };
-                }
-
-                // Jump to the shadow host and continue
-                node = shadow._host.asNode();
-                continue;
-            }
-        }
-
-        // an assigned slottable's event-path parent is its assigned slot,
-        // routing the event into the slot's shadow tree
-        if (frame_) |frame| {
-            if (frame._assigned_slots.get(n)) |slot| {
-                node = slot.asNode();
-                continue;
-            }
-        }
-
-        node = n._parent;
+    var path_buffer: [128]*EventTarget = undefined;
+    var path_len = EventManager.buildEventPath(target_node, self, frame_, &path_buffer).len;
+    if (path_len == 0) {
+        return &.{};
     }
 
-    // Add window at the end. It only participates when propagation did not stop
-    // at a shadow boundary...
-    if (stopped_at_shadow_boundary == false) {
-        // ... AND when the tree's root is a document
-        const root_is_document = path_len > 0 and switch (path_buffer[path_len - 1]._type) {
-            .node => |n| n._type == .document,
-            else => false,
-        };
-        if (root_is_document) {
-            if (path_len < path_buffer.len) {
-                switch (exec.js.global) {
-                    .worker => {},
-                    .frame => |frame| {
-                        path_buffer[path_len] = frame.window.asEventTarget();
-                        path_len += 1;
-                    },
-                }
-            }
+    // Window follows the document at the end of the path. A path that stopped
+    // early — at a shadow boundary, or at the relatedTarget — doesn't end on
+    // the document and so doesn't reach it.
+    const root_is_document = blk: {
+        const root = path_buffer[path_len - 1].is(Node) orelse break :blk false;
+        break :blk root._type == .document;
+    };
+    if (root_is_document and path_len < path_buffer.len) {
+        if (frame_) |frame| {
+            path_buffer[path_len] = frame.window.asEventTarget();
+            path_len += 1;
+        }
+    }
+
+    // The host of the first closed shadow root on the path. Everything before
+    // it is inside that root and hidden from a currentTarget outside it.
+    var closed_host_index: ?usize = null;
+    for (path_buffer[0..path_len], 0..) |entry, i| {
+        const node = entry.is(Node) orelse continue;
+        const shadow = node.is(Node.ShadowRoot) orelse continue;
+        if (shadow._mode == .closed) {
+            closed_host_index = i + 1;
+            break;
         }
     }
 
     // Determine visible path based on current_target and closed shadow boundaries
     var visible_start_index: usize = 0;
 
-    if (closed_shadow_boundary) |boundary| {
-        // Check if current_target is outside the closed shadow
-        // If current_target is null or is at/after the host position, hide shadow internals
-        const current_target = self._current_target;
-
-        if (current_target) |ct| {
-            // Find current_target in the path
-            var ct_index: ?usize = null;
+    if (closed_host_index) |host_index| {
+        // Find current_target in the path; if it's at or after the host, it's
+        // outside the closed shadow and must not see the nodes inside it.
+        if (self._current_target) |ct| {
             for (path_buffer[0..path_len], 0..) |elem, i| {
                 if (elem == ct) {
-                    ct_index = i;
+                    if (i >= host_index) {
+                        visible_start_index = host_index;
+                    }
                     break;
-                }
-            }
-
-            // If current_target is at or after the host (outside the closed shadow),
-            // hide everything from target up to the host
-            if (ct_index) |idx| {
-                if (idx >= boundary.host_start) {
-                    visible_start_index = boundary.host_start;
                 }
             }
         }
@@ -451,6 +394,11 @@ pub fn populateFromOptions(self: *Event, opts: anytype) void {
 }
 
 pub fn inheritOptions(comptime T: type, comptime additions: anytype) type {
+    // Web IDL reads inherited dictionaries least-derived first, each level's
+    // own members in lexicographic order — which the concatenation below plus
+    // this per-level check produce.
+    js.Local.assertDictionaryFieldOrder(additions);
+
     var all_fields: []const std.builtin.Type.StructField = &.{};
 
     if (@hasField(T, "_proto")) {
@@ -461,7 +409,11 @@ pub fn inheritOptions(comptime T: type, comptime additions: anytype) type {
                 const ProtoType = @typeInfo(field.type).pointer.child;
                 if (@hasDecl(ProtoType, "Options")) {
                     const parent_options = @typeInfo(ProtoType.Options);
-                    all_fields = all_fields ++ parent_options.@"struct".fields;
+                    for (parent_options.@"struct".fields) |f| {
+                        if (!std.mem.eql(u8, f.name, js.Local.dictionary_group_marker)) {
+                            all_fields = all_fields ++ &[_]std.builtin.Type.StructField{f};
+                        }
+                    }
                 }
             }
         }
@@ -470,14 +422,18 @@ pub fn inheritOptions(comptime T: type, comptime additions: anytype) type {
     const additions_info = @typeInfo(additions);
     all_fields = all_fields ++ additions_info.@"struct".fields;
 
-    var names: [all_fields.len][:0]const u8 = undefined;
-    var types: [all_fields.len]type = undefined;
-    var attrs: [all_fields.len]std.builtin.Type.StructField.Attributes = undefined;
+    const marker_default: void = {};
+    var names: [all_fields.len + 1][:0]const u8 = undefined;
+    var types: [all_fields.len + 1]type = undefined;
+    var attrs: [all_fields.len + 1]std.builtin.Type.StructField.Attributes = undefined;
     for (all_fields, 0..) |f, i| {
         names[i] = f.name;
         types[i] = f.type;
         attrs[i] = .{ .@"comptime" = f.is_comptime, .@"align" = f.alignment, .default_value_ptr = f.default_value_ptr };
     }
+    names[all_fields.len] = js.Local.dictionary_group_marker;
+    types[all_fields.len] = void;
+    attrs[all_fields.len] = .{ .default_value_ptr = @ptrCast(&marker_default) };
     return @Struct(.auto, null, &names, &types, &attrs);
 }
 

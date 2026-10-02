@@ -26,6 +26,7 @@ const DOMTokenList = @import("../../collections.zig").DOMTokenList;
 
 const HtmlElement = @import("../Html.zig");
 
+const String = lp.String;
 const Area = @This();
 
 pub const Proto = HtmlElement;
@@ -43,75 +44,8 @@ pub fn asNode(self: *Area) *Node {
     return self.asElement().asNode();
 }
 
-pub fn getAlt(self: *const Area) []const u8 {
-    return self.asConstElement().getAttributeSafe(comptime .wrap("alt")) orelse "";
-}
-
-pub fn setAlt(self: *Area, value: []const u8, frame: *Frame) !void {
-    try self.asElement().setAttributeSafe(comptime .wrap("alt"), .wrap(value), frame);
-}
-
-pub fn getCoords(self: *const Area) []const u8 {
-    return self.asConstElement().getAttributeSafe(comptime .wrap("coords")) orelse "";
-}
-
-pub fn setCoords(self: *Area, value: []const u8, frame: *Frame) !void {
-    try self.asElement().setAttributeSafe(comptime .wrap("coords"), .wrap(value), frame);
-}
-
-pub fn getShape(self: *const Area) []const u8 {
-    return self.asConstElement().getAttributeSafe(comptime .wrap("shape")) orelse "";
-}
-
-pub fn setShape(self: *Area, value: []const u8, frame: *Frame) !void {
-    try self.asElement().setAttributeSafe(comptime .wrap("shape"), .wrap(value), frame);
-}
-
-pub fn getTarget(self: *const Area) []const u8 {
-    return self.asConstElement().getAttributeSafe(comptime .wrap("target")) orelse "";
-}
-
-pub fn setTarget(self: *Area, value: []const u8, frame: *Frame) !void {
-    try self.asElement().setAttributeSafe(comptime .wrap("target"), .wrap(value), frame);
-}
-
-pub fn getDownload(self: *const Area) []const u8 {
-    return self.asConstElement().getAttributeSafe(comptime .wrap("download")) orelse "";
-}
-
-pub fn setDownload(self: *Area, value: []const u8, frame: *Frame) !void {
-    try self.asElement().setAttributeSafe(comptime .wrap("download"), .wrap(value), frame);
-}
-
-pub fn getRel(self: *const Area) []const u8 {
-    return self.asConstElement().getAttributeSafe(comptime .wrap("rel")) orelse "";
-}
-
-pub fn setRel(self: *Area, value: []const u8, frame: *Frame) !void {
-    try self.asElement().setAttributeSafe(comptime .wrap("rel"), .wrap(value), frame);
-}
-
-pub fn getReferrerPolicy(self: *const Area) []const u8 {
-    const valid_referrer_policy = [_][]const u8{
-        "",
-        "no-referrer",
-        "no-referrer-when-downgrade",
-        "same-origin",
-        "origin",
-        "strict-origin",
-        "origin-when-cross-origin",
-        "strict-origin-when-cross-origin",
-        "unsafe-url",
-    };
-    return HtmlElement.reflectEnumerated(self.asConstElement().getAttributeSafe(.wrap("referrerpolicy")), &valid_referrer_policy, "", "").?;
-}
-
-pub fn setReferrerPolicy(self: *Area, value: []const u8, frame: *Frame) !void {
-    return self.asElement().setAttributeSafe(.wrap("referrerpolicy"), .wrap(value), frame);
-}
-
 pub fn getHref(self: *Area, frame: *Frame) ![]const u8 {
-    const href = self.asElement().getAttributeSafe(comptime .wrap("href")) orelse return "";
+    const href = self.asElement().getAttributeInterned("href") orelse return "";
     if (href.len == 0) {
         return "";
     }
@@ -149,7 +83,7 @@ pub fn getHost(self: *Area, frame: *Frame) ![]const u8 {
     return host;
 }
 
-pub fn setHost(self: *Area, value: []const u8, frame: *Frame) !void {
+fn setHost(self: *Area, value: []const u8, frame: *Frame) !void {
     const href = try getResolvedHref(self, frame) orelse return;
     const new_href = try URL.setHost(href, value, frame.call_arena);
     try setHref(self, new_href, frame);
@@ -160,29 +94,29 @@ pub fn getHostname(self: *Area, frame: *Frame) ![]const u8 {
     return URL.getHostname(href);
 }
 
-pub fn setHostname(self: *Area, value: []const u8, frame: *Frame) !void {
+fn setHostname(self: *Area, value: []const u8, frame: *Frame) !void {
     const href = try getResolvedHref(self, frame) orelse return;
     const new_href = try URL.setHostname(href, value, frame.call_arena);
     try setHref(self, new_href, frame);
 }
 
-pub fn getUsername(self: *Area, frame: *Frame) ![]const u8 {
+fn getUsername(self: *Area, frame: *Frame) ![]const u8 {
     const href = try getResolvedHref(self, frame) orelse return "";
     return URL.getUsername(href);
 }
 
-pub fn setUsername(self: *Area, value: []const u8, frame: *Frame) !void {
+fn setUsername(self: *Area, value: []const u8, frame: *Frame) !void {
     const href = try getResolvedHref(self, frame) orelse return;
     const new_href = try URL.setUsername(href, value, frame.call_arena);
     try setHref(self, new_href, frame);
 }
 
-pub fn getPassword(self: *Area, frame: *Frame) ![]const u8 {
+fn getPassword(self: *Area, frame: *Frame) ![]const u8 {
     const href = try getResolvedHref(self, frame) orelse return "";
     return URL.getPassword(href);
 }
 
-pub fn setPassword(self: *Area, value: []const u8, frame: *Frame) !void {
+fn setPassword(self: *Area, value: []const u8, frame: *Frame) !void {
     const href = try getResolvedHref(self, frame) orelse return;
     const new_href = try URL.setPassword(href, value, frame.call_arena);
     try setHref(self, new_href, frame);
@@ -205,7 +139,7 @@ pub fn getPort(self: *Area, frame: *Frame) ![]const u8 {
     return port;
 }
 
-pub fn setPort(self: *Area, value: ?[]const u8, frame: *Frame) !void {
+fn setPort(self: *Area, value: ?[]const u8, frame: *Frame) !void {
     const href = try getResolvedHref(self, frame) orelse return;
     const new_href = try URL.setPort(href, value, frame.call_arena);
     try setHref(self, new_href, frame);
@@ -216,7 +150,7 @@ pub fn getSearch(self: *Area, frame: *Frame) ![]const u8 {
     return URL.getSearch(href);
 }
 
-pub fn setSearch(self: *Area, value: []const u8, frame: *Frame) !void {
+fn setSearch(self: *Area, value: []const u8, frame: *Frame) !void {
     const href = try getResolvedHref(self, frame) orelse return;
     const new_href = try URL.setSearch(href, value, frame.call_arena);
     try setHref(self, new_href, frame);
@@ -227,7 +161,7 @@ pub fn getHash(self: *Area, frame: *Frame) ![]const u8 {
     return URL.getHash(href);
 }
 
-pub fn setHash(self: *Area, value: []const u8, frame: *Frame) !void {
+fn setHash(self: *Area, value: []const u8, frame: *Frame) !void {
     const href = try getResolvedHref(self, frame) orelse return;
     const new_href = try URL.setHash(href, value, frame.call_arena);
     try setHref(self, new_href, frame);
@@ -249,7 +183,7 @@ pub fn getProtocol(self: *Area, frame: *Frame) ![]const u8 {
     return URL.getProtocol(href);
 }
 
-pub fn setProtocol(self: *Area, value: []const u8, frame: *Frame) !void {
+fn setProtocol(self: *Area, value: []const u8, frame: *Frame) !void {
     const href = try getResolvedHref(self, frame) orelse return;
     const new_href = try URL.setProtocol(href, value, frame.call_arena);
     try setHref(self, new_href, frame);
@@ -264,8 +198,13 @@ pub fn getRelList(self: *Area, frame: *Frame) !?*DOMTokenList {
     return element.getRelList(frame);
 }
 
+fn setRelList(self: *Area, value: String, frame: *Frame) !void {
+    const list = try self.getRelList(frame) orelse return;
+    try list.setValue(value, frame);
+}
+
 fn getResolvedHref(self: *Area, frame: *Frame) !?[:0]const u8 {
-    const href = self.asElement().getAttributeSafe(comptime .wrap("href")) orelse return null;
+    const href = self.asElement().getAttributeInterned("href") orelse return null;
     if (href.len == 0) {
         return null;
     }
@@ -286,6 +225,12 @@ pub const JsApi = struct {
         pub var class_id: bridge.ClassId = undefined;
     };
 
+    const reflect = Element.Reflect(Area);
+    pub const noHref = reflect.boolean("nohref");
+    pub const @"type" = reflect.string("type");
+    pub const ping = reflect.string("ping");
+    pub const hreflang = reflect.string("hreflang");
+
     pub const href = bridge.accessor(Area.getHref, Area.setHref, .{ .ce_reactions = true });
     pub const origin = bridge.accessor(Area.getOrigin, null, .{});
     pub const protocol = bridge.accessor(Area.getProtocol, Area.setProtocol, .{ .ce_reactions = true });
@@ -297,15 +242,15 @@ pub const JsApi = struct {
     pub const pathname = bridge.accessor(Area.getPathname, Area.setPathname, .{ .ce_reactions = true });
     pub const search = bridge.accessor(Area.getSearch, Area.setSearch, .{ .ce_reactions = true });
     pub const hash = bridge.accessor(Area.getHash, Area.setHash, .{ .ce_reactions = true });
-    pub const alt = bridge.accessor(Area.getAlt, Area.setAlt, .{ .ce_reactions = true });
-    pub const coords = bridge.accessor(Area.getCoords, Area.setCoords, .{ .ce_reactions = true });
-    pub const shape = bridge.accessor(Area.getShape, Area.setShape, .{ .ce_reactions = true });
-    pub const target = bridge.accessor(Area.getTarget, Area.setTarget, .{ .ce_reactions = true });
-    pub const download = bridge.accessor(Area.getDownload, Area.setDownload, .{ .ce_reactions = true });
-    pub const rel = bridge.accessor(Area.getRel, Area.setRel, .{ .ce_reactions = true });
-    pub const referrerPolicy = bridge.accessor(Area.getReferrerPolicy, Area.setReferrerPolicy, .{ .ce_reactions = true });
+    pub const alt = reflect.string("alt");
+    pub const coords = reflect.string("coords");
+    pub const shape = reflect.string("shape");
+    pub const target = reflect.string("target");
+    pub const download = reflect.string("download");
+    pub const rel = reflect.string("rel");
+    pub const referrerPolicy = reflect.referrerPolicy();
     pub const toString = bridge.function(Area.getHref, .{});
-    pub const relList = bridge.accessor(Area.getRelList, null, .{ .null_as_undefined = true });
+    pub const relList = bridge.accessor(Area.getRelList, Area.setRelList, .{ .null_as_undefined = true, .ce_reactions = true });
 };
 
 const testing = @import("../../../../testing.zig");

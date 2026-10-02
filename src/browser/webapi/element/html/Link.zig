@@ -28,6 +28,7 @@ const DOMTokenList = @import("../../collections.zig").DOMTokenList;
 
 const HtmlElement = @import("../Html.zig");
 
+const String = lp.String;
 const Link = @This();
 
 pub const Proto = HtmlElement;
@@ -51,7 +52,7 @@ pub fn asNode(self: *Link) *Node {
 
 pub fn getHref(self: *Link, frame: *Frame) ![]const u8 {
     const element = self.asElement();
-    const href = element.getAttributeSafe(comptime .wrap("href")) orelse return "";
+    const href = element.getAttributeInterned("href") orelse return "";
     if (href.len == 0) {
         return "";
     }
@@ -67,138 +68,33 @@ pub fn setHref(self: *Link, value: []const u8, frame: *Frame) !void {
     }
 }
 
-pub fn getRel(self: *Link) []const u8 {
-    return self.asElement().getAttributeSafe(comptime .wrap("rel")) orelse return "";
+fn getRel(self: *Link) []const u8 {
+    return self.asElement().getAttributeInterned("rel") orelse return "";
 }
 
-pub fn setRel(self: *Link, value: []const u8, frame: *Frame) !void {
+fn setRel(self: *Link, value: []const u8, frame: *Frame) !void {
     try self.asElement().setAttributeSafe(comptime .wrap("rel"), .wrap(value), frame);
 }
 
-pub fn getAs(self: *const Link) []const u8 {
-    const valid_as = [_][]const u8{
-        "fetch",
-        "audio",
-        "document",
-        "embed",
-        "font",
-        "image",
-        "manifest",
-        "object",
-        "report",
-        "script",
-        "sharedworker",
-        "style",
-        "track",
-        "video",
-        "worker",
-        "xslt",
-    };
-    return HtmlElement.reflectEnumerated(self.asConstElement().getAttributeSafe(comptime .wrap("as")), &valid_as, "", "").?;
-}
-
-pub fn setAs(self: *Link, value: []const u8, frame: *Frame) !void {
-    return self.asElement().setAttributeSafe(comptime .wrap("as"), .wrap(value), frame);
-}
-
-pub fn getReferrerPolicy(self: *const Link) []const u8 {
-    const valid_referrer_policy = [_][]const u8{
-        "",
-        "no-referrer",
-        "no-referrer-when-downgrade",
-        "same-origin",
-        "origin",
-        "strict-origin",
-        "origin-when-cross-origin",
-        "strict-origin-when-cross-origin",
-        "unsafe-url",
-    };
-    return HtmlElement.reflectEnumerated(self.asConstElement().getAttributeSafe(.wrap("referrerpolicy")), &valid_referrer_policy, "", "").?;
-}
-
-pub fn setReferrerPolicy(self: *Link, value: []const u8, frame: *Frame) !void {
-    return self.asElement().setAttributeSafe(.wrap("referrerpolicy"), .wrap(value), frame);
-}
-
 pub fn getMedia(self: *Link) []const u8 {
-    return self.asElement().getAttributeSafe(comptime .wrap("media")) orelse return "";
+    return self.asElement().getAttributeInterned("media") orelse return "";
 }
 
 pub fn setMedia(self: *Link, value: []const u8, frame: *Frame) !void {
     return self.asElement().setAttributeSafe(comptime .wrap("media"), .wrap(value), frame);
 }
 
-pub fn getCrossOrigin(self: *const Link) ?[]const u8 {
-    const valid_cross_origin = [_][]const u8{
-        "anonymous", "use-credentials",
-    };
-    return HtmlElement.reflectEnumerated(self.asConstElement().getAttributeSafe(comptime .wrap("crossorigin")), &valid_cross_origin, null, "anonymous");
-}
-
-pub fn setCrossOrigin(self: *Link, value: ?[]const u8, frame: *Frame) !void {
-    // Nullable reflection: a null (or undefined) value removes the attribute;
-    // otherwise the content attribute mirrors the value verbatim and the
-    // getter canonicalizes it.
-    if (value) |v| {
-        return self.asElement().setAttributeSafe(comptime .wrap("crossorigin"), .wrap(v), frame);
-    }
-    return self.asElement().removeAttribute(comptime .wrap("crossorigin"), frame);
-}
-
-pub fn getCharset(self: *const Link) []const u8 {
-    return self.asConstElement().getAttributeSafe(comptime .wrap("charset")) orelse "";
-}
-
-pub fn setCharset(self: *Link, value: []const u8, frame: *Frame) !void {
-    return self.asElement().setAttributeSafe(comptime .wrap("charset"), .wrap(value), frame);
-}
-
-pub fn getHreflang(self: *const Link) []const u8 {
-    return self.asConstElement().getAttributeSafe(comptime .wrap("hreflang")) orelse "";
-}
-
-pub fn setHreflang(self: *Link, value: []const u8, frame: *Frame) !void {
-    return self.asElement().setAttributeSafe(comptime .wrap("hreflang"), .wrap(value), frame);
-}
-
-pub fn getIntegrity(self: *const Link) []const u8 {
-    return self.asConstElement().getAttributeSafe(comptime .wrap("integrity")) orelse "";
-}
-
-pub fn setIntegrity(self: *Link, value: []const u8, frame: *Frame) !void {
-    return self.asElement().setAttributeSafe(comptime .wrap("integrity"), .wrap(value), frame);
-}
-
-pub fn getType(self: *const Link) []const u8 {
-    return self.asConstElement().getAttributeSafe(comptime .wrap("type")) orelse "";
-}
-
-pub fn setType(self: *Link, value: []const u8, frame: *Frame) !void {
-    return self.asElement().setAttributeSafe(comptime .wrap("type"), .wrap(value), frame);
-}
-
-pub fn getRev(self: *const Link) []const u8 {
-    return self.asConstElement().getAttributeSafe(comptime .wrap("rev")) orelse "";
-}
-
-pub fn setRev(self: *Link, value: []const u8, frame: *Frame) !void {
-    return self.asElement().setAttributeSafe(comptime .wrap("rev"), .wrap(value), frame);
-}
-
-pub fn getTarget(self: *const Link) []const u8 {
-    return self.asConstElement().getAttributeSafe(comptime .wrap("target")) orelse "";
-}
-
-pub fn setTarget(self: *Link, value: []const u8, frame: *Frame) !void {
-    return self.asElement().setAttributeSafe(comptime .wrap("target"), .wrap(value), frame);
-}
-
-pub fn getSizes(self: *Link, frame: *Frame) !?*DOMTokenList {
+fn getSizes(self: *Link, frame: *Frame) !?*DOMTokenList {
     const element = self.asElement();
     if (element._namespace != .html) {
         return null;
     }
     return element.getTokenList(.sizes, frame);
+}
+
+fn setSizes(self: *Link, value: String, frame: *Frame) !void {
+    const list = try self.getSizes(frame) orelse return;
+    try list.setValue(value, frame);
 }
 
 pub fn getRelList(self: *Link, frame: *Frame) !?*DOMTokenList {
@@ -210,6 +106,11 @@ pub fn getRelList(self: *Link, frame: *Frame) !?*DOMTokenList {
     return element.getRelList(frame);
 }
 
+fn setRelList(self: *Link, value: String, frame: *Frame) !void {
+    const list = try self.getRelList(frame) orelse return;
+    try list.setValue(value, frame);
+}
+
 pub fn linkAddedCallback(self: *Link, frame: *Frame) !void {
     // if we're planning on navigating to another frame, don't trigger load event.
     if (frame.isGoingAway()) {
@@ -218,12 +119,17 @@ pub fn linkAddedCallback(self: *Link, frame: *Frame) !void {
 
     const element = self.asElement();
 
-    const href = element.getAttributeSafe(comptime .wrap("href")) orelse return;
+    // A document without a browsing context (DOMParser et al.) loads nothing.
+    if (element.getDocument(frame)._frame == null) {
+        return;
+    }
+
+    const href = element.getAttributeInterned("href") orelse return;
     if (href.len == 0) {
         return;
     }
 
-    const rel = element.getAttributeSafe(comptime .wrap("rel")) orelse return;
+    const rel = element.getAttributeInterned("rel") orelse return;
 
     // Opt-in fetch for `rel="stylesheet"` — drives `frame.loadExternalStylesheet`,
     // which fires the load/error event itself.
@@ -266,20 +172,23 @@ pub const JsApi = struct {
         pub var class_id: bridge.ClassId = undefined;
     };
 
-    pub const as = bridge.accessor(Link.getAs, Link.setAs, .{ .ce_reactions = true });
+    const reflect = Element.Reflect(Link);
+    pub const nonce = reflect.string("nonce");
+
+    pub const as = reflect.enumerated("as", &.{ "fetch", "audio", "document", "embed", "font", "image", "manifest", "object", "report", "script", "sharedworker", "style", "track", "video", "worker", "xslt" }, .{});
     pub const rel = bridge.accessor(Link.getRel, Link.setRel, .{ .ce_reactions = true });
     pub const media = bridge.accessor(Link.getMedia, Link.setMedia, .{ .ce_reactions = true });
     pub const href = bridge.accessor(Link.getHref, Link.setHref, .{ .ce_reactions = true });
-    pub const crossOrigin = bridge.accessor(Link.getCrossOrigin, Link.setCrossOrigin, .{ .ce_reactions = true });
-    pub const referrerPolicy = bridge.accessor(Link.getReferrerPolicy, Link.setReferrerPolicy, .{ .ce_reactions = true });
-    pub const charset = bridge.accessor(Link.getCharset, Link.setCharset, .{ .ce_reactions = true });
-    pub const hreflang = bridge.accessor(Link.getHreflang, Link.setHreflang, .{ .ce_reactions = true });
-    pub const integrity = bridge.accessor(Link.getIntegrity, Link.setIntegrity, .{ .ce_reactions = true });
-    pub const @"type" = bridge.accessor(Link.getType, Link.setType, .{ .ce_reactions = true });
-    pub const rev = bridge.accessor(Link.getRev, Link.setRev, .{ .ce_reactions = true });
-    pub const target = bridge.accessor(Link.getTarget, Link.setTarget, .{ .ce_reactions = true });
-    pub const relList = bridge.accessor(Link.getRelList, null, .{ .null_as_undefined = true });
-    pub const sizes = bridge.accessor(Link.getSizes, null, .{ .null_as_undefined = true });
+    pub const crossOrigin = reflect.enumerated("crossorigin", &.{ "anonymous", "use-credentials" }, .{ .missing = null, .nullable = true, .invalid = "anonymous" });
+    pub const referrerPolicy = reflect.referrerPolicy();
+    pub const charset = reflect.string("charset");
+    pub const hreflang = reflect.string("hreflang");
+    pub const integrity = reflect.string("integrity");
+    pub const @"type" = reflect.string("type");
+    pub const rev = reflect.string("rev");
+    pub const target = reflect.string("target");
+    pub const relList = bridge.accessor(Link.getRelList, Link.setRelList, .{ .null_as_undefined = true, .ce_reactions = true });
+    pub const sizes = bridge.accessor(Link.getSizes, Link.setSizes, .{ .null_as_undefined = true, .ce_reactions = true });
 };
 
 // Parser-created <link> elements are void (no closing tag) so they never
@@ -300,7 +209,7 @@ test "WebApi: HTML.Link" {
 
 test "WebApi: HTML.Link external stylesheet" {
     testing.silenceLog(&.{.http});
-    try testing.htmlRunner("css/external_stylesheet.html", .{ .load_external_stylesheets = true });
+    try testing.htmlRunner("css/external_stylesheet.html", .{ .load_resources = .{ .stylesheet = true } });
 }
 
 // Regression: a synchronous external-stylesheet fetch must not strand the
@@ -309,5 +218,5 @@ test "WebApi: HTML.Link external stylesheet" {
 // never drains and the document is stuck at readyState "loading".
 test "WebApi: HTML.Link deferred script then external stylesheet" {
     testing.silenceLog(&.{.http});
-    try testing.htmlRunner("css/deferred_script_then_stylesheet.html", .{ .load_external_stylesheets = true });
+    try testing.htmlRunner("css/deferred_script_then_stylesheet.html", .{ .load_resources = .{ .stylesheet = true } });
 }

@@ -35,6 +35,7 @@ const log = lp.log;
 const String = lp.String;
 const Execution = js.Execution;
 const Allocator = std.mem.Allocator;
+const h5e = @import("../../parser/html5ever.zig");
 
 const FormData = @This();
 
@@ -76,6 +77,10 @@ pub const Entry = struct {
 };
 
 pub fn init(form_: ?*Form, submitter: ?*Element, exec: *const Execution) !*FormData {
+    return initWithCharset(form_, submitter, "UTF-8", exec);
+}
+
+pub fn initWithCharset(form_: ?*Form, submitter: ?*Element, charset: []const u8, exec: *const Execution) !*FormData {
     const arena = try exec.getArena(.small, "FormData");
     errdefer arena.release();
 
@@ -101,7 +106,7 @@ pub fn init(form_: ?*Form, submitter: ?*Element, exec: *const Execution) !*FormD
     form._constructing_entry_list = true;
     defer form._constructing_entry_list = false;
 
-    form_data._entries = try collectForm(arena.allocator(), form, submitter, frame);
+    form_data._entries = try collectForm(arena.allocator(), form, submitter, charset, frame);
 
     // Hold a reference on each entry's File for the FormData's lifetime; released
     // in deinit.
@@ -209,7 +214,7 @@ pub fn has(self: *const FormData, name: String) bool {
     return false;
 }
 
-pub const EntryValue = union(enum) {
+const EntryValue = union(enum) {
     blob: *Blob, // can be of _type == .file
     bytes: []const u8, //must be last, everything can coerce to a []const u8
 };
@@ -314,7 +319,7 @@ pub fn forEach(self: *FormData, cb_: js.Function, js_this_: ?js.Object) !void {
     for (self._entries.items) |*entry| {
         cb.call(void, .{ entry.value.asString(), entry.name.str(), self }) catch |err| {
             // this is a non-JS error
-            log.warn(.js, "FormData.forEach", .{ .err = err });
+            log.debug(.js, "FormData.forEach", .{ .err = err });
         };
     }
 }
@@ -326,35 +331,34 @@ pub const EncType = union(enum) {
     plaintext,
 };
 
-pub const WriteOpts = struct {
+const WriteOpts = struct {
     encoding: EncType = .urlencode,
     charset: []const u8 = "UTF-8",
-    allocator: ?std.mem.Allocator = null,
 };
 
-pub fn write(self: *const FormData, opts: WriteOpts, writer: *std.Io.Writer) !void {
+pub fn write(self: *const FormData, allocator: Allocator, opts: WriteOpts, writer: *std.Io.Writer) !void {
     switch (opts.encoding) {
-        .urlencode => return self.urlEncode(opts, writer),
-        .formdata => |boundary| return self.multipartEncode(boundary, writer),
+        .urlencode => return self.urlEncode(allocator, opts.charset, writer),
+        .formdata => |boundary| return self.multipartEncode(allocator, boundary, opts.charset, writer),
         .plaintext => return self.plaintextEncode(writer),
     }
 }
 
-fn urlEncode(self: *const FormData, opts: WriteOpts, writer: *std.Io.Writer) !void {
+fn urlEncode(self: *const FormData, allocator: Allocator, charset: []const u8, writer: *std.Io.Writer) !void {
     const items = self._entries.items;
     if (items.len == 0) return;
 
-    try urlEncodeEntry(&items[0], opts, writer);
+    try urlEncodeEntry(&items[0], allocator, charset, writer);
     for (items[1..]) |*entry| {
         try writer.writeByte('&');
-        try urlEncodeEntry(entry, opts, writer);
+        try urlEncodeEntry(entry, allocator, charset, writer);
     }
 }
 
-fn urlEncodeEntry(entry: *const Entry, opts: WriteOpts, writer: *std.Io.Writer) !void {
-    try KeyValueList.urlEncodeFormValue(entry.name.str(), opts.allocator, opts.charset, writer);
+fn urlEncodeEntry(entry: *const Entry, allocator: Allocator, charset: []const u8, writer: *std.Io.Writer) !void {
+    try KeyValueList.urlEncodeFormValue(entry.name.str(), allocator, charset, writer);
     try writer.writeByte('=');
-    try KeyValueList.urlEncodeFormValue(entry.value.asString(), opts.allocator, opts.charset, writer);
+    try KeyValueList.urlEncodeFormValue(entry.value.asString(), allocator, charset, writer);
 }
 
 /// https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#text/plain-encoding-algorithm
@@ -371,22 +375,23 @@ fn plaintextEncode(self: *const FormData, writer: *std.Io.Writer) !void {
     }
 }
 
-fn multipartEncode(self: *const FormData, boundary: []const u8, writer: *std.Io.Writer) !void {
+fn multipartEncode(self: *const FormData, allocator: Allocator, boundary: []const u8, charset: []const u8, writer: *std.Io.Writer) !void {
     for (self._entries.items) |*entry| {
-        try multipartEncodeEntry(entry, boundary, writer);
+        try multipartEncodeEntry(entry, allocator, boundary, charset, writer);
     }
     try writer.print("--{s}--\r\n", .{boundary});
 }
 
-fn multipartEncodeEntry(entry: *const Entry, boundary: []const u8, writer: *std.Io.Writer) !void {
+fn multipartEncodeEntry(entry: *const Entry, allocator: Allocator, boundary: []const u8, charset: []const u8, writer: *std.Io.Writer) !void {
     try writer.print("--{s}\r\n", .{boundary});
+    const name = try encodeForCharset(allocator, entry.name.str(), charset);
     const value_ptr = &entry.value;
     switch (value_ptr.*) {
         .string => |*s| {
             try writer.writeAll("Content-Disposition: form-data; name=\"");
-            try writeMultipartName(writer, entry.name.str());
+            try writeMultipartName(writer, name, .normalize_newlines);
             try writer.writeAll("\"\r\n\r\n");
-            try writer.writeAll(s.str());
+            try writeNormalizedNewlines(writer, try encodeForCharset(allocator, s.str(), charset));
             try writer.writeAll("\r\n");
         },
         // Per RFC 7578 + WHATWG FormData: file parts carry a filename in
@@ -394,9 +399,9 @@ fn multipartEncodeEntry(entry: *const Entry, boundary: []const u8, writer: *std.
         // application/octet-stream when the Blob has no MIME), and the raw bytes.
         .file => |file| {
             try writer.writeAll("Content-Disposition: form-data; name=\"");
-            try writeMultipartName(writer, entry.name.str());
+            try writeMultipartName(writer, name, .normalize_newlines);
             try writer.writeAll("\"; filename=\"");
-            try writeMultipartName(writer, file.getName());
+            try writeMultipartName(writer, try encodeForCharset(allocator, file.getName(), charset), .verbatim_newlines);
             try writer.writeAll("\"\r\n");
 
             const mime = file._proto._mime;
@@ -413,7 +418,7 @@ fn multipartEncodeEntry(entry: *const Entry, boundary: []const u8, writer: *std.
         // algorithm creates, and Chrome's wire output.
         .no_file => {
             try writer.writeAll("Content-Disposition: form-data; name=\"");
-            try writeMultipartName(writer, entry.name.str());
+            try writeMultipartName(writer, name, .normalize_newlines);
             try writer.writeAll("\"; filename=\"\"\r\n");
             try writer.writeAll("Content-Type: application/octet-stream\r\n\r\n");
             try writer.writeAll("\r\n");
@@ -421,15 +426,68 @@ fn multipartEncodeEntry(entry: *const Entry, boundary: []const u8, writer: *std.
     }
 }
 
-// Per RFC 7578 §4.2, Content-Disposition names are quoted-string form;
-// CR/LF/" must be escaped.
-fn writeMultipartName(writer: *std.Io.Writer, name: []const u8) !void {
-    for (name) |c| {
-        switch (c) {
+/// Re-encodes UTF-8 text into the form's submission encoding
+fn encodeForCharset(allocator: Allocator, input: []const u8, charset: []const u8) ![]const u8 {
+    if (input.len == 0 or std.mem.eql(u8, charset, "UTF-8")) {
+        return input;
+    }
+
+    const info = h5e.encoding_for_label(charset.ptr, charset.len);
+    if (info.isValid() == false) {
+        return input;
+    }
+
+    const base_len = h5e.encoding_max_encode_buffer_length(info.handle.?, input.len);
+    if (base_len == 0) {
+        return input;
+    }
+
+    // Because of numeric character refernece (NCR) a single character can
+    // become "&#NNNNNNN;", so give it room to grow.
+    const buf = try allocator.alloc(u8, base_len * 4);
+    const result = h5e.encoding_encode_with_ncr(info.handle.?, input.ptr, input.len, buf.ptr, buf.len);
+    if (result.isSuccess() == false) {
+        return input;
+    }
+    return buf[0..result.bytes_written];
+}
+
+// multipart/form-data normalizes lone CR and lone LF into CRLF
+fn writeNormalizedNewlines(writer: *std.Io.Writer, text: []const u8) !void {
+    var i: usize = 0;
+    while (i < text.len) : (i += 1) {
+        switch (text[i]) {
+            '\r' => {
+                try writer.writeAll("\r\n");
+                if (i + 1 < text.len and text[i + 1] == '\n') {
+                    i += 1;
+                }
+            },
+            '\n' => try writer.writeAll("\r\n"),
+            else => |c| try writer.writeByte(c),
+        }
+    }
+}
+
+const Newlines = enum { normalize_newlines, verbatim_newlines };
+// Content-Disposition names are quoted-string form, CR and LF must be escaped
+fn writeMultipartName(writer: *std.Io.Writer, name: []const u8, comptime newlines: Newlines) !void {
+    var i: usize = 0;
+    while (i < name.len) : (i += 1) {
+        switch (name[i]) {
             '"' => try writer.writeAll("%22"),
-            '\r' => try writer.writeAll("%0D"),
-            '\n' => try writer.writeAll("%0A"),
-            else => try writer.writeByte(c),
+            '\r' => {
+                if (comptime newlines == .normalize_newlines) {
+                    try writer.writeAll("%0D%0A");
+                    if (i + 1 < name.len and name[i + 1] == '\n') {
+                        i += 1;
+                    }
+                } else {
+                    try writer.writeAll("%0D");
+                }
+            },
+            '\n' => try writer.writeAll(if (comptime newlines == .normalize_newlines) "%0D%0A" else "%0A"),
+            else => |c| try writer.writeByte(c),
         }
     }
 }
@@ -437,7 +495,7 @@ fn writeMultipartName(writer: *std.Io.Writer, name: []const u8) !void {
 // Inverse of urlEncode: application/x-www-form-urlencoded parsing per
 // URL §5.1 — '+' decodes to a space, invalid percent sequences pass through
 // verbatim, and a pair without '=' becomes an entry with an empty value.
-pub fn parseUrlEncoded(self: *FormData, bytes: []const u8) !void {
+fn parseUrlEncoded(self: *FormData, bytes: []const u8) !void {
     var it = std.mem.splitScalar(u8, bytes, '&');
     while (it.next()) |pair| {
         if (pair.len == 0) {
@@ -734,7 +792,7 @@ pub fn registerTypes() []const type {
     };
 }
 
-fn collectForm(arena: Allocator, form_: ?*Form, submitter_: ?*Element, frame: *Frame) !std.ArrayList(Entry) {
+fn collectForm(arena: Allocator, form_: ?*Form, submitter_: ?*Element, charset: []const u8, frame: *Frame) !std.ArrayList(Entry) {
     var list: std.ArrayList(Entry) = .empty;
     const form = form_ orelse return list;
 
@@ -753,7 +811,7 @@ fn collectForm(arena: Allocator, form_: ?*Form, submitter_: ?*Element, frame: *F
                     continue;
                 }
 
-                const name = element.getAttributeSafe(comptime .wrap("name"));
+                const name = element.getName();
                 const x_key = if (name) |n| try std.fmt.allocPrint(arena, "{s}.x", .{n}) else "x";
                 const y_key = if (name) |n| try std.fmt.allocPrint(arena, "{s}.y", .{n}) else "y";
                 try appendString(&list, arena, x_key, "0");
@@ -762,7 +820,7 @@ fn collectForm(arena: Allocator, form_: ?*Form, submitter_: ?*Element, frame: *F
             }
         }
 
-        const name = element.getAttributeSafe(comptime .wrap("name")) orelse continue;
+        const name = element.getName() orelse continue;
         const value = blk: {
             if (element.is(Form.Input)) |input| {
                 const input_type = input._input_type;
@@ -776,6 +834,11 @@ fn collectForm(arena: Allocator, form_: ?*Form, submitter_: ?*Element, frame: *F
                     if (submitter != element) {
                         continue;
                     }
+                }
+                if (input_type == .hidden and std.ascii.eqlIgnoreCase(name, "_charset_")) {
+                    // The FormData's charset is used as the value for hidden
+                    // field name "_charset"
+                    break :blk charset;
                 }
                 if (input_type == .file) {
                     // WHATWG: a file input with zero selected files contributes a
@@ -798,18 +861,14 @@ fn collectForm(arena: Allocator, form_: ?*Form, submitter_: ?*Element, frame: *F
             }
 
             if (element.is(Form.Select)) |select| {
-                if (select.getMultiple() == false) {
-                    // Per the HTML spec, a single-select with no selectedness
-                    // candidate (zero options or every option disabled)
-                    // contributes no entry. Otherwise emit the candidate's
-                    // value.
-                    const opt = select.effectiveOption() orelse continue;
-                    break :blk opt.getValue(frame);
-                }
-
                 var options = try select.getSelectedOptions(frame);
-                while (options.next()) |option| {
-                    try appendString(&list, arena, name, option.as(Form.Select.Option).getValue(frame));
+                while (options.next()) |node| {
+                    const option = node.as(Form.Select.Option);
+                    // A disabled option can be selected, but isn't submitted.
+                    if (option.asElement().isDisabled()) {
+                        continue;
+                    }
+                    try appendString(&list, arena, name, option.getValue(frame));
                 }
                 continue;
             }
@@ -888,10 +947,7 @@ test "FormData: multipart write" {
     try fd.appendText("note", "two\r\nlines");
 
     var buf = std.Io.Writer.Allocating.init(allocator);
-    try fd.write(.{
-        .encoding = .{ .formdata = "BOUNDARY" },
-        .allocator = allocator,
-    }, &buf.writer);
+    try fd.write(allocator, .{ .encoding = .{ .formdata = "BOUNDARY" } }, &buf.writer);
 
     try testing.expectString(
         "--BOUNDARY\r\n" ++
@@ -918,10 +974,7 @@ test "FormData: multipart escapes name CR/LF/quote" {
     try fd.appendText("a\"b\r\nc", "v");
 
     var buf = std.Io.Writer.Allocating.init(allocator);
-    try fd.write(.{
-        .encoding = .{ .formdata = "B" },
-        .allocator = allocator,
-    }, &buf.writer);
+    try fd.write(allocator, .{ .encoding = .{ .formdata = "B" } }, &buf.writer);
 
     try testing.expectString(
         "--B\r\n" ++
@@ -944,10 +997,7 @@ test "FormData: multipart empty body" {
     };
 
     var buf = std.Io.Writer.Allocating.init(allocator);
-    try fd.write(.{
-        .encoding = .{ .formdata = "B" },
-        .allocator = allocator,
-    }, &buf.writer);
+    try fd.write(allocator, .{ .encoding = .{ .formdata = "B" } }, &buf.writer);
 
     try testing.expectString("--B--\r\n", buf.written());
 }
@@ -974,8 +1024,8 @@ test "FormData: multipart with file" {
     const frame = try testing.createFrame();
     defer testing.test_session.closeAllPages();
 
-    const file = try buildTestFile(allocator, frame._page, "hello.txt", "text/plain", "hello");
-    defer file._proto.releaseRef(frame._page);
+    const file = try buildTestFile(allocator, frame.page, "hello.txt", "text/plain", "hello");
+    defer file._proto.releaseRef(frame.page);
 
     var fd = FormData{
         ._rc = .{},
@@ -989,10 +1039,7 @@ test "FormData: multipart with file" {
     });
 
     var buf = std.Io.Writer.Allocating.init(allocator);
-    try fd.write(.{
-        .encoding = .{ .formdata = "BOUNDARY" },
-        .allocator = allocator,
-    }, &buf.writer);
+    try fd.write(allocator, .{ .encoding = .{ .formdata = "BOUNDARY" } }, &buf.writer);
 
     try testing.expectString(
         "--BOUNDARY\r\n" ++
@@ -1014,8 +1061,8 @@ test "FormData: multipart with empty file defaults to octet-stream" {
     const frame = try testing.createFrame();
     defer testing.test_session.closeAllPages();
 
-    const file = try buildTestFile(allocator, frame._page, "", "", "");
-    defer file._proto.releaseRef(frame._page);
+    const file = try buildTestFile(allocator, frame.page, "", "", "");
+    defer file._proto.releaseRef(frame.page);
 
     var fd = FormData{
         ._rc = .{},
@@ -1028,10 +1075,7 @@ test "FormData: multipart with empty file defaults to octet-stream" {
     });
 
     var buf = std.Io.Writer.Allocating.init(allocator);
-    try fd.write(.{
-        .encoding = .{ .formdata = "B" },
-        .allocator = allocator,
-    }, &buf.writer);
+    try fd.write(allocator, .{ .encoding = .{ .formdata = "B" } }, &buf.writer);
 
     try testing.expectString(
         "--B\r\n" ++
@@ -1050,8 +1094,8 @@ test "FormData: multipart escapes file name and filename" {
     const frame = try testing.createFrame();
     defer testing.test_session.closeAllPages();
 
-    const file = try buildTestFile(allocator, frame._page, "a\"b\r\nc.txt", "text/plain", "x");
-    defer file._proto.releaseRef(frame._page);
+    const file = try buildTestFile(allocator, frame.page, "a\"b\r\nc.txt", "text/plain", "x");
+    defer file._proto.releaseRef(frame.page);
 
     var fd = FormData{
         ._rc = .{},
@@ -1064,10 +1108,7 @@ test "FormData: multipart escapes file name and filename" {
     });
 
     var buf = std.Io.Writer.Allocating.init(allocator);
-    try fd.write(.{
-        .encoding = .{ .formdata = "B" },
-        .allocator = allocator,
-    }, &buf.writer);
+    try fd.write(allocator, .{ .encoding = .{ .formdata = "B" } }, &buf.writer);
 
     try testing.expectString(
         "--B\r\n" ++
@@ -1086,8 +1127,8 @@ test "FormData: file entry collapses to filename in urlencode" {
     const frame = try testing.createFrame();
     defer testing.test_session.closeAllPages();
 
-    const file = try buildTestFile(allocator, frame._page, "hello.txt", "text/plain", "hello");
-    defer file._proto.releaseRef(frame._page);
+    const file = try buildTestFile(allocator, frame.page, "hello.txt", "text/plain", "hello");
+    defer file._proto.releaseRef(frame.page);
 
     var fd = FormData{
         ._rc = .{},
@@ -1100,7 +1141,7 @@ test "FormData: file entry collapses to filename in urlencode" {
     });
 
     var buf = std.Io.Writer.Allocating.init(allocator);
-    try fd.write(.{ .encoding = .urlencode, .allocator = allocator }, &buf.writer);
+    try fd.write(allocator, .{ .encoding = .urlencode }, &buf.writer);
     try testing.expectString("upload=hello.txt", buf.written());
 }
 
@@ -1120,10 +1161,7 @@ test "FormData: multipart no_file (unselected file input)" {
     });
 
     var buf = std.Io.Writer.Allocating.init(allocator);
-    try fd.write(.{
-        .encoding = .{ .formdata = "B" },
-        .allocator = allocator,
-    }, &buf.writer);
+    try fd.write(allocator, .{ .encoding = .{ .formdata = "B" } }, &buf.writer);
 
     try testing.expectString(
         "--B\r\n" ++
@@ -1151,7 +1189,7 @@ test "FormData: no_file entry collapses to empty in urlencode" {
     });
 
     var buf = std.Io.Writer.Allocating.init(allocator);
-    try fd.write(.{ .encoding = .urlencode, .allocator = allocator }, &buf.writer);
+    try fd.write(allocator, .{ .encoding = .urlencode }, &buf.writer);
     try testing.expectString("upload=", buf.written());
 }
 
@@ -1170,7 +1208,7 @@ test "FormData: plaintext write" {
     try fd.appendText("equals", "a=b");
 
     var buf = std.Io.Writer.Allocating.init(allocator);
-    try fd.write(.{ .encoding = .plaintext, .allocator = allocator }, &buf.writer);
+    try fd.write(allocator, .{ .encoding = .plaintext }, &buf.writer);
 
     // Per WHATWG HTML text/plain encoding algorithm: name=value CRLF per entry.
     // Values containing "=" or CRLF are written verbatim — the spec accepts that
@@ -1195,7 +1233,7 @@ test "FormData: plaintext empty body" {
     };
 
     var buf = std.Io.Writer.Allocating.init(allocator);
-    try fd.write(.{ .encoding = .plaintext, .allocator = allocator }, &buf.writer);
+    try fd.write(allocator, .{ .encoding = .plaintext }, &buf.writer);
 
     try testing.expectString("", buf.written());
 }
@@ -1292,7 +1330,7 @@ test "FormData: multipart parse with file" {
         "bytes\r\n" ++
         "--B--\r\n", "B", &frame.js.execution);
     defer for (fd._entries.items) |entry| switch (entry.value) {
-        .file => |file| file.releaseRef(frame._page),
+        .file => |file| file.releaseRef(frame.page),
         else => {},
     };
 
@@ -1355,10 +1393,7 @@ test "FormData: multipart round-trip" {
     try src.appendText("a\tb", "tabbed");
 
     var buf = std.Io.Writer.Allocating.init(allocator);
-    try src.write(.{
-        .encoding = .{ .formdata = "BOUNDARY" },
-        .allocator = allocator,
-    }, &buf.writer);
+    try src.write(allocator, .{ .encoding = .{ .formdata = "BOUNDARY" } }, &buf.writer);
 
     var fd = FormData{
         ._rc = .{},

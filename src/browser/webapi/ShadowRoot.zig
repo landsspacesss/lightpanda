@@ -19,10 +19,13 @@
 const std = @import("std");
 const js = @import("../js/js.zig");
 
+const dump = @import("../dump.zig");
 const Frame = @import("../Frame.zig");
+
 const Node = @import("Node.zig");
-const DocumentFragment = @import("DocumentFragment.zig");
 const Element = @import("Element.zig");
+const Sanitizer = @import("Sanitizer.zig");
+const DocumentFragment = @import("DocumentFragment.zig");
 
 const ShadowRoot = @This();
 
@@ -60,7 +63,7 @@ _removed_ids: std.StringHashMapUnmanaged(void) = .{},
 _adopted_style_sheets: ?js.Object.Global = null,
 
 pub fn init(host: *Element, opts: AttachOptions, frame: *Frame) !*ShadowRoot {
-    return frame._factory.documentFragment(ShadowRoot{
+    return frame._factory.documentFragment(host.getDocument(frame), ShadowRoot{
         ._proto = undefined,
         ._mode = opts.mode,
         ._host = host,
@@ -92,36 +95,61 @@ pub fn getHost(self: *const ShadowRoot) *Element {
     return self._host;
 }
 
-pub fn getDelegatesFocus(self: *const ShadowRoot) bool {
+fn getDelegatesFocus(self: *const ShadowRoot) bool {
     return self._delegates_focus;
 }
 
-pub fn getSlotAssignment(self: *const ShadowRoot) []const u8 {
+fn getSlotAssignment(self: *const ShadowRoot) []const u8 {
     return @tagName(self._slot_assignment);
 }
 
-pub fn getClonable(self: *const ShadowRoot) bool {
+fn getClonable(self: *const ShadowRoot) bool {
     return self._clonable;
 }
 
-pub fn getSerializable(self: *const ShadowRoot) bool {
+fn getSerializable(self: *const ShadowRoot) bool {
     return self._serializable;
 }
 
-pub fn setHTMLUnsafe(self: *ShadowRoot, html: []const u8, frame: *Frame) !void {
-    return self.asDocumentFragment().setHTMLUnsafe(html, frame);
+pub fn setHTML(self: *ShadowRoot, html: []const u8, options: ?Sanitizer.Options, frame: *Frame) !void {
+    return Sanitizer.setAndFilterHTML(self.asNode(), self._host, html, options, true, frame);
 }
 
-pub fn getOnSlotChange(self: *ShadowRoot, frame: *Frame) ?js.Function.Global {
+pub fn setHTMLUnsafe(self: *ShadowRoot, html: []const u8, options: ?Sanitizer.Options, frame: *Frame) !void {
+    return Sanitizer.setAndFilterHTML(self.asNode(), self._host, html, options, false, frame);
+}
+
+pub fn getHTML(self: *ShadowRoot, opts: dump.Opts.Shadow.Declarative, writer: *std.Io.Writer, frame: *Frame) !void {
+    return dump.getHTML(self.asNode(), opts, writer, frame);
+}
+
+fn getOnSlotChange(self: *ShadowRoot, frame: *Frame) ?js.Function.Global {
     return frame._event_target_attr_listeners.get(.{ .target = self.asEventTarget(), .handler = .onslotchange });
 }
 
-pub fn setOnSlotChange(self: *ShadowRoot, callback: ?js.Function.Global, frame: *Frame) !void {
+fn setOnSlotChange(self: *ShadowRoot, callback: ?js.Function.Global, frame: *Frame) !void {
     if (callback) |cb| {
         try frame._event_target_attr_listeners.put(frame.arena, .{ .target = self.asEventTarget(), .handler = .onslotchange }, cb);
     } else {
         _ = frame._event_target_attr_listeners.remove(.{ .target = self.asEventTarget(), .handler = .onslotchange });
     }
+}
+
+pub fn getActiveElement(self: *ShadowRoot, frame: *Frame) ?*Element {
+    const root = self.asNode();
+    const document = root.ownerDocument(frame) orelse frame.document;
+
+    // This is answering two questions:
+    // 1 - is the active element contained by me (if not, return null)
+    // 2 - if it is, is there 1+ other shadowroot between us
+    //     a - if there is, return the nearest (to self) shadowroot's host
+    //     b - if there isn't, return the active element
+    var candidate = document._active_element orelse return null;
+    while (candidate.asNode().getRootNode(.{}) != root) {
+        const shadow = candidate.asNode().containingShadowRoot() orelse return null;
+        candidate = shadow._host;
+    }
+    return candidate;
 }
 
 pub fn getElementById(self: *ShadowRoot, id: []const u8, frame: *Frame) ?*Element {
@@ -139,7 +167,7 @@ pub fn getElementById(self: *ShadowRoot, id: []const u8, frame: *Frame) ?*Elemen
         // Do a tree walk to find another element with this ID
         var tw = @import("TreeWalker.zig").Full.Elements.init(self.asNode(), .{});
         while (tw.next()) |el| {
-            const element_id = el.getAttributeSafe(comptime .wrap("id")) orelse continue;
+            const element_id = el.getId() orelse continue;
             if (std.mem.eql(u8, element_id, id)) {
                 // we ignore this error to keep getElementById easy to call
                 // if it really failed, then we're out of memory and nothing's
@@ -154,7 +182,7 @@ pub fn getElementById(self: *ShadowRoot, id: []const u8, frame: *Frame) ?*Elemen
     return null;
 }
 
-pub fn getAdoptedStyleSheets(self: *ShadowRoot, frame: *Frame) !js.Object.Global {
+fn getAdoptedStyleSheets(self: *ShadowRoot, frame: *Frame) !js.Object.Global {
     if (self._adopted_style_sheets) |ass| {
         return ass;
     }
@@ -164,7 +192,7 @@ pub fn getAdoptedStyleSheets(self: *ShadowRoot, frame: *Frame) !js.Object.Global
     return self._adopted_style_sheets.?;
 }
 
-pub fn setAdoptedStyleSheets(self: *ShadowRoot, sheets: js.Object) !void {
+fn setAdoptedStyleSheets(self: *ShadowRoot, sheets: js.Object) !void {
     self._adopted_style_sheets = try sheets.persist();
 }
 
@@ -177,6 +205,7 @@ pub const JsApi = struct {
         pub var class_id: bridge.ClassId = undefined;
     };
 
+    pub const activeElement = bridge.accessor(ShadowRoot.getActiveElement, null, .{});
     pub const mode = bridge.accessor(ShadowRoot.getMode, null, .{});
     pub const host = bridge.accessor(ShadowRoot.getHost, null, .{});
     pub const delegatesFocus = bridge.accessor(ShadowRoot.getDelegatesFocus, null, .{});
@@ -195,7 +224,22 @@ pub const JsApi = struct {
         return self.getElementById(try value.toZig([]const u8), frame);
     }
     pub const adoptedStyleSheets = bridge.accessor(ShadowRoot.getAdoptedStyleSheets, ShadowRoot.setAdoptedStyleSheets, .{});
+    pub const setHTML = bridge.function(ShadowRoot.setHTML, .{ .ce_reactions = true });
     pub const setHTMLUnsafe = bridge.function(ShadowRoot.setHTMLUnsafe, .{ .ce_reactions = true });
+    pub const getHTML = bridge.function(_getHTML, .{});
+    const GetHTMLOpts = struct {
+        serializableShadowRoots: bool = false,
+        shadowRoots: []const *ShadowRoot = &.{},
+    };
+    fn _getHTML(self: *ShadowRoot, opts_: ?GetHTMLOpts, frame: *Frame) ![]const u8 {
+        const opts = opts_ orelse GetHTMLOpts{};
+        var buf = std.Io.Writer.Allocating.init(frame.local_arena);
+        try self.getHTML(.{
+            .shadow_roots = opts.shadowRoots,
+            .serializable_shadow_roots = opts.serializableShadowRoots,
+        }, &buf.writer, frame);
+        return buf.written();
+    }
     pub const onslotchange = bridge.accessor(ShadowRoot.getOnSlotChange, ShadowRoot.setOnSlotChange, .{});
 };
 

@@ -22,7 +22,6 @@ const js = @import("../js/js.zig");
 
 const AbortSignal = @import("AbortSignal.zig");
 
-const log = lp.log;
 const Execution = js.Execution;
 
 const Scheduler = @This();
@@ -49,8 +48,8 @@ const TaskState = struct {
 };
 
 const PostTaskOptions = struct {
-    priority: ?Priority = null,
     delay: ?u32 = null,
+    priority: ?Priority = null,
     signal: ?*AbortSignal = null,
 };
 

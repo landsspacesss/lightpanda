@@ -35,9 +35,9 @@ _writable: *WritableStream,
 _controller: *TransformStreamDefaultController,
 
 const Transformer = struct {
+    flush: ?js.Function.Global = null,
     start: ?js.Function = null,
     transform: ?js.Function.Global = null,
-    flush: ?js.Function.Global = null,
 };
 
 pub fn init(transformer_: ?Transformer, exec: *const Execution) !*TransformStream {
@@ -174,7 +174,7 @@ pub const TransformStreamDefaultController = struct {
         try self._stream._readable._controller.enqueueValue(value);
     }
 
-    pub fn doError(self: *TransformStreamDefaultController, reason: []const u8) !void {
+    fn doError(self: *TransformStreamDefaultController, reason: []const u8) !void {
         try self._stream._readable._controller.doError(reason);
     }
 

@@ -17,49 +17,157 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 const std = @import("std");
-const js = @import("../js/js.zig");
+const lp = @import("lightpanda");
 
+const js = @import("../js/js.zig");
 const Page = @import("../Page.zig");
+const Factory = @import("../Factory.zig");
 const EventManager = @import("../EventManager.zig");
 
+const Node = @import("Node.zig");
 const Event = @import("Event.zig");
+const Screen = @import("Screen.zig");
+const Worker = @import("Worker.zig");
+const Window = @import("Window.zig");
+const FileReader = @import("FileReader.zig");
 const AbortSignal = @import("AbortSignal.zig");
+const MessagePort = @import("MessagePort.zig");
+const Performance = @import("Performance.zig");
+const Notification = @import("Notification.zig");
+const SharedWorker = @import("SharedWorker.zig");
+const ServiceWorker = @import("ServiceWorker.zig");
+const ServiceWorkerContainer = @import("ServiceWorkerContainer.zig");
+const ServiceWorkerRegistration = @import("ServiceWorkerRegistration.zig");
+const VisualViewport = @import("VisualViewport.zig");
+const BroadcastChannel = @import("BroadcastChannel.zig");
+const WorkerGlobalScope = @import("WorkerGlobalScope.zig");
+
+const WebSocket = @import("net/WebSocket.zig");
+const EventSource = @import("net/EventSource.zig");
+const CookieStore = @import("storage/CookieStore.zig");
+const IDBRequest = @import("storage/idb/IDBRequest.zig");
+const IDBDatabase = @import("storage/idb/IDBDatabase.zig");
+const IDBTransaction = @import("storage/idb/IDBTransaction.zig");
+
+const FontFaceSet = @import("css/FontFaceSet.zig");
+const MediaQueryList = @import("css/MediaQueryList.zig");
+
+const TextTrackCue = @import("media/TextTrackCue.zig");
+
+const Navigation = @import("navigation/Navigation.zig");
+const NavigationHistoryEntry = @import("navigation/NavigationHistoryEntry.zig");
+const XMLHttpRequestEventTarget = @import("net/XMLHttpRequestEventTarget.zig");
 
 const RegisterOptions = EventManager.RegisterOptions;
 
 const EventTarget = @This();
 
 pub const _prototype_root = true;
-_type: Type,
 
-pub const Type = union(enum) {
-    generic: void,
-    node: *@import("Node.zig"),
-    window: *@import("Window.zig"),
-    worker: *@import("Worker.zig"),
-    shared_worker: *@import("SharedWorker.zig"),
-    worker_global_scope: *@import("WorkerGlobalScope.zig"),
-    xhr: *@import("net/XMLHttpRequestEventTarget.zig"),
-    abort_signal: *@import("AbortSignal.zig"),
-    media_query_list: *@import("css/MediaQueryList.zig"),
-    message_port: *@import("MessagePort.zig"),
-    broadcast_channel: *@import("BroadcastChannel.zig"),
-    text_track_cue: *@import("media/TextTrackCue.zig"),
-    navigation: *@import("navigation/Navigation.zig"),
-    navigation_history_entry: *@import("navigation/NavigationHistoryEntry.zig"),
-    screen: *@import("Screen.zig"),
-    screen_orientation: *@import("Screen.zig").Orientation,
-    visual_viewport: *@import("VisualViewport.zig"),
-    file_reader: *@import("FileReader.zig"),
-    font_face_set: *@import("css/FontFaceSet.zig"),
-    websocket: *@import("net/WebSocket.zig"),
-    event_source: *@import("net/EventSource.zig"),
-    cookie_store: *@import("storage/CookieStore.zig"),
-    idb_request: *@import("storage/idb/IDBRequest.zig"),
-    idb_database: *@import("storage/idb/IDBDatabase.zig"),
-    idb_transaction: *@import("storage/idb/IDBTransaction.zig"),
-    notification: *@import("Notification.zig"),
+// `global_event_handlers.Key` reuses the low 3 bits of an EventTarget pointer,
+// so the type has to stay 8-byte aligned even though the tag is a single byte.
+// This costs nothing in a chain: EventTarget is always at offset 0 and every
+// subtype that follows it is itself 8-aligned.
+_type: Type align(8),
+
+pub const Type = enum(u8) {
+    abort_signal,
+    broadcast_channel,
+    cookie_store,
+    event_source,
+    file_reader,
+    font_face_set,
+    generic,
+    idb_database,
+    idb_request,
+    idb_transaction,
+    media_query_list,
+    message_port,
+    navigation,
+    navigation_history_entry,
+    node,
+    notification,
+    performance,
+    screen,
+    screen_orientation,
+    service_worker,
+    service_worker_container,
+    service_worker_registration,
+    shared_worker,
+    text_track_cue,
+    visual_viewport,
+    websocket,
+    window,
+    worker,
+    worker_global_scope,
+    xhr,
 };
+
+// `.generic` maps to EventTarget itself: a standalone `new EventTarget()` has
+// no chain member of its own.
+pub fn Subtype(comptime tag: Type) type {
+    return switch (tag) {
+        .abort_signal => AbortSignal,
+        .broadcast_channel => BroadcastChannel,
+        .cookie_store => CookieStore,
+        .event_source => EventSource,
+        .file_reader => FileReader,
+        .font_face_set => FontFaceSet,
+        .generic => EventTarget,
+        .idb_database => IDBDatabase,
+        .idb_request => IDBRequest,
+        .idb_transaction => IDBTransaction,
+        .media_query_list => MediaQueryList,
+        .message_port => MessagePort,
+        .navigation => Navigation,
+        .navigation_history_entry => NavigationHistoryEntry,
+        .node => Node,
+        .notification => Notification,
+        .performance => Performance,
+        .screen => Screen,
+        .screen_orientation => Screen.Orientation,
+        .service_worker => ServiceWorker,
+        .service_worker_container => ServiceWorkerContainer,
+        .service_worker_registration => ServiceWorkerRegistration,
+        .shared_worker => SharedWorker,
+        .text_track_cue => TextTrackCue,
+        .visual_viewport => VisualViewport,
+        .websocket => WebSocket,
+        .window => Window,
+        .worker => Worker,
+        .worker_global_scope => WorkerGlobalScope,
+        .xhr => XMLHttpRequestEventTarget,
+    };
+}
+
+pub fn subtype(self: *const EventTarget, comptime T: type) *T {
+    const offset = comptime Factory.chainOffsetOf(T, T) - Factory.chainOffsetOf(T, EventTarget);
+    const sub: *T = @ptrFromInt(@intFromPtr(self) + offset);
+    if (comptime lp.IS_DEBUG) {
+        // This pointer dance only works because the factory allocates the chain
+        // in a contiguous block of memory. In debug, we assert this holds via
+        // the _proto_canary back pointer.
+        std.debug.assert(Factory.protoOf(sub) == self);
+    }
+    return sub;
+}
+
+// Returns the target as a more specific type, or null if it isn't a `T`.
+pub fn is(self: *EventTarget, comptime T: type) ?*T {
+    switch (self._type) {
+        .generic => {},
+        inline else => |tag| {
+            if (Subtype(tag) == T) {
+                return self.subtype(T);
+            }
+        },
+    }
+    return null;
+}
+
+pub fn as(self: *EventTarget, comptime T: type) *T {
+    return self.is(T).?;
+}
 
 pub fn init(page: *Page) !*EventTarget {
     return page.factory.create(EventTarget{
@@ -80,7 +188,7 @@ pub fn dispatchEvent(self: *EventTarget, event: *Event, exec: *js.Execution) !bo
     switch (exec.js.global) {
         .frame => |frame| {
             event.acquireRef();
-            defer _ = event.releaseRef(frame._page);
+            defer _ = event.releaseRef(frame.page);
             try frame._event_manager.dispatch(self, event);
         },
         .worker => |wgs| try wgs.dispatch(self, event, null, .{}),
@@ -98,8 +206,8 @@ const AddEventListenerOptions = union(enum) {
     // passive is optional so that an absent (or undefined) member falls back
     // to the type- and target-dependent default passive value.
     const Options = struct {
-        once: bool = false,
         capture: bool = false,
+        once: bool = false,
         passive: ?bool = null,
         signal: ?js.Value = null,
     };
@@ -121,8 +229,9 @@ fn defaultPassiveValue(self: *EventTarget, typ: []const u8) bool {
 
     switch (self._type) {
         .window => return true,
-        .node => |n| {
+        .node => {
             const Element = @import("Element.zig");
+            const n = self.subtype(Node);
             if (n._type == .document) {
                 return true;
             }
@@ -136,7 +245,7 @@ fn defaultPassiveValue(self: *EventTarget, typ: []const u8) bool {
     }
 }
 
-pub const EventListenerCallback = union(enum) {
+const EventListenerCallback = union(enum) {
     function: js.Function,
     object: js.Object,
 };
@@ -169,9 +278,7 @@ pub fn addEventListener(self: *EventTarget, typ: []const u8, callback_: js.Nulla
         .function => |func| .{ .function = func },
     };
 
-    switch (exec.js.global) {
-        inline else => |g| _ = try g._event_manager.register(self, typ, em_callback, options),
-    }
+    return exec.registerListener(self, typ, em_callback, options);
 }
 
 const RemoveEventListenerOptions = union(enum) {
@@ -205,17 +312,18 @@ pub fn removeEventListener(self: *EventTarget, typ: []const u8, callback_: js.Nu
         };
     };
 
-    switch (exec.js.global) {
-        inline else => |g| g._event_manager.remove(self, typ, em_callback, use_capture),
-    }
+    exec.removeListener(self, typ, em_callback, use_capture);
 }
 
 pub fn format(self: *EventTarget, writer: *std.Io.Writer) !void {
     return switch (self._type) {
-        .node => |n| n.format(writer),
+        .node => self.subtype(Node).format(writer),
         .generic => writer.writeAll("<EventTarget>"),
         .window => writer.writeAll("<Window>"),
         .worker => writer.writeAll("<Worker>"),
+        .service_worker => writer.writeAll("<ServiceWorker>"),
+        .service_worker_container => writer.writeAll("<ServiceWorkerContainer>"),
+        .service_worker_registration => writer.writeAll("<ServiceWorkerRegistration>"),
         .shared_worker => writer.writeAll("<SharedWorker>"),
         .worker_global_scope => writer.writeAll("<WorkerGlobalScope>"),
         .xhr => writer.writeAll("<XMLHttpRequestEventTarget>"),
@@ -243,32 +351,36 @@ pub fn format(self: *EventTarget, writer: *std.Io.Writer) !void {
 
 pub fn toString(self: *EventTarget) []const u8 {
     return switch (self._type) {
-        .node => return "[object Node]",
-        .generic => return "[object EventTarget]",
-        .window => return "[object Window]",
-        .worker => return "[object Worker]",
-        .shared_worker => return "[object SharedWorker]",
-        .worker_global_scope => return "[object WorkerGlobalScope]",
-        .xhr => return "[object XMLHttpRequestEventTarget]",
         .abort_signal => return "[object AbortSignal]",
-        .media_query_list => return "[object MediaQueryList]",
-        .message_port => return "[object MessagePort]",
         .broadcast_channel => return "[object BroadcastChannel]",
-        .text_track_cue => return "[object TextTrackCue]",
-        .navigation => return "[object Navigation]",
-        .screen => return "[object Screen]",
-        .screen_orientation => return "[object ScreenOrientation]",
-        .visual_viewport => return "[object VisualViewport]",
+        .cookie_store => return "[object CookieStore]",
+        .event_source => return "[object EventSource]",
         .file_reader => return "[object FileReader]",
         .font_face_set => return "[object FontFaceSet]",
-        .websocket => return "[object WebSocket]",
-        .event_source => return "[object EventSource]",
-        .cookie_store => return "[object CookieStore]",
-        .idb_request => return "[object IDBRequest]",
+        .generic => return "[object EventTarget]",
         .idb_database => return "[object IDBDatabase]",
+        .idb_request => return "[object IDBRequest]",
         .idb_transaction => return "[object IDBTransaction]",
-        .notification => return "[object Notification]",
+        .media_query_list => return "[object MediaQueryList]",
+        .message_port => return "[object MessagePort]",
+        .navigation => return "[object Navigation]",
         .navigation_history_entry => return "[object NavigationHistoryEntry]",
+        .node => return "[object Node]",
+        .notification => return "[object Notification]",
+        .performance => return "[object Performance]",
+        .screen => return "[object Screen]",
+        .screen_orientation => return "[object ScreenOrientation]",
+        .service_worker => return "[object ServiceWorker]",
+        .service_worker_container => return "[object ServiceWorkerContainer]",
+        .service_worker_registration => return "[object ServiceWorkerRegistration]",
+        .shared_worker => return "[object SharedWorker]",
+        .text_track_cue => return "[object TextTrackCue]",
+        .visual_viewport => return "[object VisualViewport]",
+        .websocket => return "[object WebSocket]",
+        .window => return "[object Window]",
+        .worker => return "[object Worker]",
+        .worker_global_scope => return "[object WorkerGlobalScope]",
+        .xhr => return "[object XMLHttpRequestEventTarget]",
     };
 }
 
@@ -293,6 +405,8 @@ test "WebApi: EventTarget" {
     testing.silenceLog(&.{ .js, .event });
 
     // we create thousands of these per frame. Nothing should bloat it.
-    try testing.expectEqual(16, @sizeOf(EventTarget));
+    // The tag is 1 byte; the rest is the align(8) that `Key.fuse` depends on.
+    try testing.expectEqual(8, @sizeOf(EventTarget));
+    try testing.expectEqual(8, @alignOf(EventTarget));
     try testing.htmlRunner("events.html", .{});
 }

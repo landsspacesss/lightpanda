@@ -31,15 +31,15 @@ const Brand = struct {
     version: []const u8,
 };
 
-pub fn getBrands(_: *const NavigatorUAData) []const Brand {
+fn getBrands(_: *const NavigatorUAData) []const Brand {
     return brandList();
 }
 
-pub fn getMobile(_: *const NavigatorUAData) bool {
+fn getMobile(_: *const NavigatorUAData) bool {
     return false;
 }
 
-pub fn getPlatform(_: *const NavigatorUAData) []const u8 {
+fn getPlatform(_: *const NavigatorUAData) []const u8 {
     return uaPlatform();
 }
 
@@ -55,12 +55,14 @@ pub fn toJSON(_: *const NavigatorUAData) struct {
     };
 }
 
-pub fn getHighEntropyValues(_: *const NavigatorUAData, hints: []const []const u8, exec: *const Execution) !js.Promise {
+fn getHighEntropyValues(_: *const NavigatorUAData, hints: []const []const u8, exec: *const Execution) !js.Promise {
     // This should always return `brands` + `mobile` + `platform` and then whatever
     // "hints" field is requested (assuming the browser has permission), but it's
     // also valid to just return everything.
 
     _ = hints;
+
+    const brands = brandList();
 
     return exec.js.local.?.resolvePromise(.{
         .brands = brandList(),
@@ -70,8 +72,8 @@ pub fn getHighEntropyValues(_: *const NavigatorUAData, hints: []const []const u8
         .bitness = uaBitness(),
         .model = "",
         .platformVersion = "",
-        .uaFullVersion = "1.0.0.0",
-        .fullVersionList = brandList(),
+        .uaFullVersion = if (brands.len > 0) brands[0].version else "1.0.0.0",
+        .fullVersionList = brands,
         .wow64 = false,
         .formFactor = [_][]const u8{"Desktop"},
     });
@@ -82,7 +84,7 @@ fn brandList() []const Brand {
         const src = &Config.HttpHeaders.brands;
         var arr: [src.len]Brand = undefined;
         for (src, 0..) |b, i| {
-            arr[i] = .{ .brand = b.brand, .version = b.version };
+            arr[i] = .{ .brand = b.brand, .version = b.full_version };
         }
         const final = arr;
         break :blk final;

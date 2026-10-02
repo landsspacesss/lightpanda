@@ -33,8 +33,8 @@ _reason: ?js.Value.Global = null,
 _promise: ?js.Promise.Global = null,
 
 const PromiseRejectionEventOptions = struct {
-    reason: ?js.Value.Global = null,
     promise: ?js.Promise.Global = null,
+    reason: ?js.Value.Global = null,
 };
 
 const Options = Event.inheritOptions(PromiseRejectionEvent, PromiseRejectionEventOptions);
@@ -81,11 +81,11 @@ pub fn asEvent(self: *PromiseRejectionEvent) *Event {
     return self._proto;
 }
 
-pub fn getReason(self: *const PromiseRejectionEvent) ?js.Value.Global {
+fn getReason(self: *const PromiseRejectionEvent) ?js.Value.Global {
     return self._reason;
 }
 
-pub fn getPromise(self: *const PromiseRejectionEvent) ?js.Promise.Global {
+fn getPromise(self: *const PromiseRejectionEvent) ?js.Promise.Global {
     return self._promise;
 }
 

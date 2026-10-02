@@ -22,22 +22,14 @@ pub fn asNode(self: *Base) *Node {
     return self.asElement().asNode();
 }
 
-pub fn getTarget(self: *Base) []const u8 {
-    return self.asElement().getAttributeSafe(comptime .wrap("target")) orelse "";
-}
-
-pub fn setTarget(self: *Base, value: []const u8, frame: *Frame) !void {
-    try self.asElement().setAttributeSafe(comptime .wrap("target"), .wrap(value), frame);
-}
-
 pub fn getHref(self: *Base, frame: *Frame) ![]const u8 {
     const element = self.asElement();
-    const href = element.getAttributeSafe(comptime .wrap("href")) orelse return "";
+    const href = element.getAttributeInterned("href") orelse return "";
     if (href.len == 0) {
         return "";
     }
-    const owner = element.asConstNode().ownerFrame(frame);
-    return URL.resolve(frame.local_arena, owner.url, href, .{});
+    const doc = element.asConstNode().ownerDocument(frame).?;
+    return URL.resolve(frame.local_arena, doc.getURL(frame), href, .{});
 }
 
 pub fn setHref(self: *Base, value: []const u8, frame: *Frame) !void {
@@ -53,12 +45,12 @@ pub fn setHref(self: *Base, value: []const u8, frame: *Frame) !void {
         return;
     }
 
-    const owner = node.ownerFrame(frame);
+    const owner = node.ownerFrame(frame) orelse return;
     const first = (try owner.document.querySelector(comptime .wrap("base[href]"), owner)) orelse {
         owner.base_url = null;
         return;
     };
-    const href = first.getAttributeSafe(comptime .wrap("href")) orelse {
+    const href = first.getAttributeInterned("href") orelse {
         owner.base_url = null;
         return;
     };
@@ -78,8 +70,10 @@ pub const JsApi = struct {
         pub var class_id: bridge.ClassId = undefined;
     };
 
+    const reflect = Element.Reflect(Base);
+
     pub const href = bridge.accessor(Base.getHref, Base.setHref, .{ .ce_reactions = true });
-    pub const target = bridge.accessor(Base.getTarget, Base.setTarget, .{ .ce_reactions = true });
+    pub const target = reflect.string("target");
 };
 
 const testing = @import("../../../../testing.zig");

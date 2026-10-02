@@ -190,7 +190,7 @@ pub fn removeListener(self: *EventManagerBase, list: *std.DoublyLinkedList, list
 }
 
 /// Check if there are any listeners registered for a target/type combination.
-pub fn hasListeners(self: *EventManagerBase, target: *EventTarget, typ: []const u8) bool {
+fn hasListeners(self: *EventManagerBase, target: *EventTarget, typ: []const u8) bool {
     return self.lookup.get(.{
         .event_target = @intFromPtr(target),
         .type_string = .wrap(typ),
@@ -203,6 +203,24 @@ pub fn getListeners(self: *EventManagerBase, target: *EventTarget, event_type: S
         .event_target = @intFromPtr(target),
         .type_string = event_type,
     });
+}
+
+/// Whether the list still holds a listener, or one that can call
+/// preventDefault. A listener removed during a dispatch stays linked until
+/// the dispatch unwinds, but isn't "in" the list anymore, same as
+/// findListener.
+pub fn hasListener(list: *const std.DoublyLinkedList, comptime which: enum { any, non_passive }) bool {
+    var node = list.first;
+    while (node) |n| : (node = n.next) {
+        const listener: *align(8) Listener = @fieldParentPtr("node", n);
+        if (listener.removed) {
+            continue;
+        }
+        if (which == .any or !listener.passive) {
+            return true;
+        }
+    }
+    return false;
 }
 
 // Dispatching can be recursive from the compiler's point of view, so we need to
@@ -219,6 +237,7 @@ pub const DispatchError = error{
 pub const DispatchDirectOptions = struct {
     context: []const u8 = "dispatchDirect",
     inject_target: bool = true,
+    run_microtasks: bool = true,
 };
 
 /// Direct dispatch for non-DOM targets. No propagation - just calls the property
@@ -249,7 +268,9 @@ pub fn dispatchDirect(
     var ls: js.Local.Scope = undefined;
     ctx.localScope(&ls);
     defer {
-        ls.local.runMicrotasks();
+        if (comptime opts.run_microtasks) {
+            ls.local.runMicrotasks();
+        }
         ls.deinit();
     }
 
@@ -296,7 +317,7 @@ pub fn dispatchDirect(
             if (err == error.JsException) {
                 event._listeners_did_throw = true;
             } else {
-                log.warn(.event, opts.context, .{ .err = err, .caught = caught });
+                log.debug(.event, opts.context, .{ .err = err, .caught = caught });
             }
         };
     }
@@ -451,7 +472,7 @@ pub const Listener = struct {
                         reportException(&try_catch, local);
                     },
                     error.ExecutionTerminated => return error.ExecutionTerminated,
-                    else => log.warn(.event, context, .{ .err = err }),
+                    else => log.debug(.event, context, .{ .err = err }),
                 };
             },
             .string => |string| {
@@ -464,7 +485,7 @@ pub const Listener = struct {
                     if (err == error.JsException) {
                         event._listeners_did_throw = true;
                     } else {
-                        log.warn(.event, context, .{ .err = err });
+                        log.debug(.event, context, .{ .err = err });
                     }
                 };
             },
@@ -482,7 +503,7 @@ pub const Listener = struct {
                         event._listeners_did_throw = true;
                         reportException(&try_catch, local);
                     } else {
-                        log.warn(.event, context, .{ .err = err });
+                        log.debug(.event, context, .{ .err = err });
                     }
                     return;
                 };
@@ -508,7 +529,7 @@ pub const Listener = struct {
                         reportException(&try_catch, local);
                     },
                     error.ExecutionTerminated => return error.ExecutionTerminated,
-                    else => log.warn(.event, context, .{ .err = err }),
+                    else => log.debug(.event, context, .{ .err = err }),
                 };
             },
         }
@@ -524,7 +545,7 @@ pub const Listener = struct {
     fn reportExceptionValue(local: *const js.Local, exc: js.Value) void {
         switch (local.ctx.global) {
             .frame => |frame| frame.window.reportError(exc, frame) catch |err| {
-                log.warn(.event, "listener report error", .{ .err = err });
+                log.debug(.event, "listener report error", .{ .err = err });
             },
             // No worker error-event plumbing here (yet); still count it.
             .worker => local.ctx.page.recordJsError(error.JsException),
@@ -537,14 +558,14 @@ pub const Function = union(enum) {
     string: String,
     object: js.Object.Global,
 
-    pub fn eqlFunction(self: Function, func: js.Function) bool {
+    fn eqlFunction(self: Function, func: js.Function) bool {
         return switch (self) {
             .value => |v| v.isEqual(func),
             else => false,
         };
     }
 
-    pub fn eqlObject(self: Function, obj: js.Object) bool {
+    fn eqlObject(self: Function, obj: js.Object) bool {
         return switch (self) {
             .object => |o| return o.isEqual(obj),
             else => false,

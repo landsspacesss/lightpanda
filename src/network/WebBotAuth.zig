@@ -121,9 +121,9 @@ pub fn signRequest(
     const encoded = try arena.alloc(u8, encoded_len);
     _ = std.base64.standard.Encoder.encode(encoded, &sig);
 
-    try transfer.addHeader("Signature-Agent", try std.fmt.allocPrint(arena, "\"{s}\"", .{self.directory_url}), .{});
-    try transfer.addHeader("Signature-Input", try std.fmt.allocPrint(arena, "sig1={s}", .{sig_input_value}), .{});
-    try transfer.addHeader("Signature", try std.fmt.allocPrint(arena, "sig1=:{s}:", .{encoded}), .{});
+    try transfer.setHeader("Signature-Agent", try std.fmt.allocPrint(arena, "\"{s}\"", .{self.directory_url}), .{});
+    try transfer.setHeader("Signature-Input", try std.fmt.allocPrint(arena, "sig1={s}", .{sig_input_value}), .{});
+    try transfer.setHeader("Signature", try std.fmt.allocPrint(arena, "sig1=:{s}:", .{encoded}), .{});
 }
 
 pub fn deinit(self: WebBotAuth, allocator: std.mem.Allocator) void {
@@ -242,14 +242,12 @@ test "signRequest: adds headers with correct names" {
         .arena = arena,
         .owner = null,
         .req = .{
-            .frame_id = 0,
-            .loader_id = 0,
             .method = .GET,
             .url = "https://example.com/",
-            .cookie_jar = null,
-            .cookie_origin = "",
+            .origin = null,
+            .credentials_mode = .omit,
+            .request_mode = .no_cors,
             .resource_type = .document,
-            .notification = undefined,
             .shutdown_callback = @import("HttpClient.zig").noopShutdown,
         },
         .client = undefined,

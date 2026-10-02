@@ -17,7 +17,7 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 const std = @import("std");
-const posix = std.posix;
+const lp = @import("lightpanda");
 
 const Config = @import("../Config.zig");
 const sys_net = @import("../sys/net.zig");
@@ -25,12 +25,13 @@ const libcurl = @import("../sys/libcurl.zig");
 const crypto = @import("../sys/libcrypto.zig");
 
 const IpFilter = @import("IpFilter.zig");
+const Certificates = @import("Certificates.zig");
 
-const log = @import("lightpanda").log;
+const log = lp.log;
+const posix = std.posix;
 
-pub const ENABLE_DEBUG = false;
+const ENABLE_DEBUG = false;
 
-pub const WaitFd = libcurl.CurlWaitFd;
 pub const readfunc_pause = libcurl.curl_readfunc_pause;
 pub const writefunc_error = libcurl.curl_writefunc_error;
 pub const WsFrameType = libcurl.WsFrameType;
@@ -50,6 +51,15 @@ pub const Method = enum(u8) {
     OPTIONS = 5,
     PATCH = 6,
     PROPFIND = 7,
+
+    // The safe methods of RFC 9110 9.2.1 (we have no TRACE). PROPFIND is
+    // read-only in practice but isn't on that list.
+    pub fn isSafe(self: Method) bool {
+        return switch (self) {
+            .GET, .HEAD, .OPTIONS => true,
+            .PUT, .POST, .DELETE, .PATCH, .PROPFIND => false,
+        };
+    }
 };
 
 pub const Header = struct {
@@ -60,6 +70,13 @@ pub const Header = struct {
         key: []const u8,
         value: []const u8,
     };
+
+    pub fn normalize(self: Header, allocator: std.mem.Allocator) !Header {
+        return .{
+            .name = try std.ascii.allocLowerString(allocator, self.name),
+            .value = try allocator.dupe(u8, self.value),
+        };
+    }
 
     pub fn parse(header_str: []const u8) ?Header {
         const colon_pos = std.mem.indexOfScalar(u8, header_str, ':') orelse return null;
@@ -94,7 +111,7 @@ pub const Header = struct {
         return null;
     }
 
-    pub const ParamIterator = struct {
+    const ParamIterator = struct {
         rest: []const u8,
 
         pub fn next(self: *ParamIterator) ?Param {
@@ -115,64 +132,6 @@ pub const Header = struct {
                 return .{ .key = key, .value = value };
             }
             return null;
-        }
-    };
-};
-
-// In normal cases, the header iterator comes from the curl connection.
-// But it's also possible to inject a response, via `transfer.fulfill`. In that
-// case, the response headers are a list, []const Http.Header.
-// This union, is an iterator that exposes the same API for either case.
-pub const HeaderIterator = union(enum) {
-    curl: CurlHeaderIterator,
-    list: ListHeaderIterator,
-
-    pub fn next(self: *HeaderIterator) ?Header {
-        switch (self.*) {
-            inline else => |*it| return it.next(),
-        }
-    }
-
-    pub fn collect(self: *HeaderIterator, allocator: std.mem.Allocator) !std.ArrayList(Header) {
-        var list: std.ArrayList(Header) = .empty;
-
-        while (self.next()) |hdr| {
-            try list.append(allocator, .{
-                .name = try allocator.dupe(u8, hdr.name),
-                .value = try allocator.dupe(u8, hdr.value),
-            });
-        }
-
-        return list;
-    }
-
-    const CurlHeaderIterator = struct {
-        conn: *const Connection,
-        prev: ?*libcurl.CurlHeader = null,
-
-        pub fn next(self: *CurlHeaderIterator) ?Header {
-            const h = libcurl.curl_easy_nextheader(self.conn._easy, .header, -1, self.prev) orelse return null;
-            self.prev = h;
-
-            const header = h.*;
-            return .{
-                .name = std.mem.span(header.name),
-                .value = std.mem.span(header.value),
-            };
-        }
-    };
-
-    const ListHeaderIterator = struct {
-        index: usize = 0,
-        list: []const Header,
-
-        pub fn next(self: *ListHeaderIterator) ?Header {
-            const idx = self.index;
-            if (idx == self.list.len) {
-                return null;
-            }
-            self.index = idx + 1;
-            return self.list[idx];
         }
     };
 };
@@ -214,6 +173,32 @@ pub const AuthChallenge = struct {
     }
 };
 
+// The actual reason phrase from the server, verbatim. HTTP/2 has none, so "".
+pub const StatusText = struct {
+    pub const MAX_LEN = 128;
+
+    _len: ?u8 = null,
+    _buf: [MAX_LEN]u8 = undefined,
+
+    pub fn fromStatusLine(line: []const u8) StatusText {
+        const trimmed = std.mem.trimEnd(u8, line, "\r\n");
+        // HTTP-version SP status-code SP [ reason-phrase ]
+        const sp1 = std.mem.indexOfScalar(u8, trimmed, ' ') orelse return .{ ._len = 0 };
+        const sp2 = std.mem.indexOfScalarPos(u8, trimmed, sp1 + 1, ' ') orelse return .{ ._len = 0 };
+        const phrase = trimmed[sp2 + 1 ..];
+        const len = @min(phrase.len, MAX_LEN);
+
+        var st: StatusText = .{ ._len = @intCast(len) };
+        @memcpy(st._buf[0..len], phrase[0..len]);
+        return st;
+    }
+
+    pub fn get(self: *const StatusText) ?[]const u8 {
+        const len = self._len orelse return null;
+        return self._buf[0..len];
+    }
+};
+
 pub const ResponseHead = struct {
     // Matches Mime.parse's 255-byte cap
     pub const MAX_CONTENT_TYPE_LEN = 255;
@@ -248,9 +233,9 @@ fn opensocketCallback(
     if (filter.isBlockedSockaddr(address)) {
         if (address.family == posix.AF.INET or address.family == posix.AF.INET6) {
             const ip = sys_net.addressFromSockaddr(@ptrCast(@alignCast(&address.addr)));
-            log.warn(.http, "blocked by IP filter", .{ .ip = ip });
+            log.debug(.http, "blocked by IP filter", .{ .ip = ip });
         } else {
-            log.warn(.http, "blocked by IP filter", .{ .family = address.family });
+            log.debug(.http, "blocked by IP filter", .{ .family = address.family });
         }
         return libcurl.CURL_SOCKET_BAD;
     }
@@ -280,7 +265,7 @@ pub const Connection = struct {
     };
 
     pub fn init(
-        x509_store: *crypto.X509_STORE,
+        certificates: Certificates,
         config: *const Config,
         ip_filter: ?*const IpFilter,
     ) !Connection {
@@ -289,7 +274,7 @@ pub const Connection = struct {
         var self = Connection{ ._easy = easy, .transport = .none };
         errdefer self.deinit();
 
-        try self.reset(config, x509_store, ip_filter);
+        try self.reset(config, certificates, ip_filter);
         return self;
     }
 
@@ -345,6 +330,11 @@ pub const Connection = struct {
         try libcurl.curl_easy_setopt(easy, .post, true);
         try libcurl.curl_easy_setopt(easy, .post_field_size, body.len);
         try libcurl.curl_easy_setopt(easy, .copy_post_fields, body.ptr);
+    }
+
+    pub fn setNoBody(self: *const Connection) !void {
+        const easy = self._easy;
+        try libcurl.curl_easy_setopt(easy, .no_body, true);
     }
 
     pub fn setGetMode(self: *const Connection) !void {
@@ -405,6 +395,13 @@ pub const Connection = struct {
         try libcurl.curl_easy_setopt(self._easy, .connect_only, value);
     }
 
+    // Close this connection when the transfer ends instead of returning it to
+    // libcurl's keepalive pool. Read by libcurl when the transfer completes,
+    // so it can be set while the response is being received.
+    pub fn setForbidReuse(self: *const Connection) !void {
+        try libcurl.curl_easy_setopt(self._easy, .forbid_reuse, true);
+    }
+
     pub fn setWriteCallback(
         self: *Connection,
         comptime data_cb: libcurl.CurlWriteFunction,
@@ -443,7 +440,7 @@ pub const Connection = struct {
     pub fn reset(
         self: *Connection,
         config: *const Config,
-        x509_store: *crypto.X509_STORE,
+        certificates: Certificates,
         ip_filter: ?*const IpFilter,
     ) !void {
         libcurl.curl_easy_reset(self._easy);
@@ -453,6 +450,9 @@ pub const Connection = struct {
         // timeouts
         try libcurl.curl_easy_setopt(self._easy, .timeout_ms, config.httpTimeout());
         try libcurl.curl_easy_setopt(self._easy, .connect_timeout_ms, config.httpConnectTimeout());
+
+        // Otherwise requests issued before ALPN settles each open a socket.
+        try libcurl.curl_easy_setopt(self._easy, .pipewait, true);
 
         // compression, don't remove this. CloudFront will send gzip content
         // even if we don't support it, and then it won't be decompressed.
@@ -487,7 +487,7 @@ pub const Connection = struct {
                 }
             }).wrap);
             // Pass our store to CURLOPT_SSL_CTX_FUNCTION.
-            try libcurl.curl_easy_setopt(self._easy, .ssl_ctx_data, x509_store);
+            try libcurl.curl_easy_setopt(self._easy, .ssl_ctx_data, certificates.store);
         } else {
             try libcurl.curl_easy_setopt(self._easy, .ssl_verify_host, false);
             try libcurl.curl_easy_setopt(self._easy, .ssl_verify_peer, false);
@@ -528,6 +528,14 @@ pub const Connection = struct {
         try libcurl.curl_easy_setopt(self._easy, .proxy, if (proxy) |p| p.ptr else null);
     }
 
+    pub fn setHttpVersion(self: *const Connection, version: Config.HttpVersion) !void {
+        const v: libcurl.CurlHttpVersion = switch (version) {
+            .auto => .none,
+            .@"1.1" => .v1_1,
+        };
+        try libcurl.curl_easy_setopt(self._easy, .http_version, v);
+    }
+
     pub fn setFollowLocation(self: *const Connection, follow: bool) !void {
         try libcurl.curl_easy_setopt(self._easy, .follow_location, @as(c_long, if (follow) 2 else 0));
     }
@@ -550,25 +558,20 @@ pub const Connection = struct {
     pub fn getConnectCode(self: *const Connection) !u16 {
         var status: c_long = undefined;
         try libcurl.curl_easy_getinfo(self._easy, .connect_code, &status);
-        if (status < 0 or status > std.math.maxInt(u16)) {
-            return 0;
-        }
-        return @intCast(status);
+        return inHttpRange(status);
     }
 
     pub fn getResponseCode(self: *const Connection) !u16 {
         var status: c_long = undefined;
         try libcurl.curl_easy_getinfo(self._easy, .response_code, &status);
-        if (status < 0 or status > std.math.maxInt(u16)) {
-            return 0;
-        }
-        return @intCast(status);
+        return inHttpRange(status);
     }
 
-    pub fn getRedirectCount(self: *const Connection) !u32 {
-        var count: c_long = undefined;
-        try libcurl.curl_easy_getinfo(self._easy, .redirect_count, &count);
-        return @intCast(count);
+    /// 0 outside 100..599, which is curl's own value for having no status.
+    /// Consumers cast this into `std.http.Status`, an enum(u10).
+    fn inHttpRange(status: c_long) u16 {
+        if (status < 100 or status > 599) return 0;
+        return @intCast(status);
     }
 
     // -1 when the transfer used no connection.
@@ -591,6 +594,48 @@ pub const Connection = struct {
         return micros;
     }
 
+    // microseconds from the moment the transfer started. Reused connections
+    // will report zero (or almost zero) for namelookup/connect/appconnect.
+    pub const Timing = struct {
+        queue: u64,
+        namelookup: u64,
+        connect: u64,
+        appconnect: u64,
+        pretransfer: u64,
+        starttransfer: u64,
+        total: u64,
+    };
+
+    pub fn getTiming(self: *const Connection) !Timing {
+        return .{
+            .queue = try self.getInfoMicros(.queue_time_t),
+            .namelookup = try self.getInfoMicros(.namelookup_time_t),
+            .connect = try self.getInfoMicros(.connect_time_t),
+            .appconnect = try self.getInfoMicros(.appconnect_time_t),
+            .pretransfer = try self.getInfoMicros(.pretransfer_time_t),
+            .starttransfer = try self.getInfoMicros(.starttransfer_time_t),
+            .total = try self.getInfoMicros(.total_time_t),
+        };
+    }
+
+    fn getInfoMicros(self: *const Connection, comptime info: libcurl.CurlInfo) !u64 {
+        var micros: c_long = undefined;
+        try libcurl.curl_easy_getinfo(self._easy, info, &micros);
+        return @intCast(@max(0, micros));
+    }
+
+    pub fn getDownloadSize(self: *const Connection) !u64 {
+        var size: c_long = undefined;
+        try libcurl.curl_easy_getinfo(self._easy, .size_download_t, &size);
+        return @intCast(@max(0, size));
+    }
+
+    pub fn getHttpVersion(self: *const Connection) !libcurl.CurlHttpVersion {
+        var version: c_long = undefined;
+        try libcurl.curl_easy_getinfo(self._easy, .http_version, &version);
+        return @enumFromInt(version);
+    }
+
     pub fn getConnectHeader(self: *const Connection, name: [:0]const u8, index: usize) ?HeaderValue {
         var hdr: ?*libcurl.CurlHeader = null;
         libcurl.curl_easy_header(self._easy, name, index, .connect, -1, &hdr) catch |err| {
@@ -607,6 +652,21 @@ pub const Connection = struct {
             .amount = h.amount,
             .value = std.mem.span(h.value),
         };
+    }
+
+    // Copies the response headers, names lowercased, into `allocator`.
+    pub fn collectResponseHeaders(self: *const Connection, allocator: std.mem.Allocator) ![]const Header {
+        var list: std.ArrayList(Header) = .empty;
+        var prev: ?*libcurl.CurlHeader = null;
+        while (libcurl.curl_easy_nextheader(self._easy, .header, -1, prev)) |h| {
+            prev = h;
+            const hdr: Header = .{
+                .name = std.mem.span(h.name),
+                .value = std.mem.span(h.value),
+            };
+            try list.append(allocator, try hdr.normalize(allocator));
+        }
+        return list.items;
     }
 
     pub fn getResponseHeader(self: *const Connection, name: [:0]const u8, index: usize) ?HeaderValue {
@@ -658,6 +718,9 @@ pub const Handles = struct {
         errdefer libcurl.curl_multi_cleanup(multi) catch {};
 
         try libcurl.curl_multi_setopt(multi, .max_host_connections, config.httpMaxHostOpen());
+        // Default is 4x the attached easy handles, i.e. ~0 between page loads,
+        // so keepalive connections were evicted on every cross-site navigation.
+        try libcurl.curl_multi_setopt(multi, .max_connects, 4 * @as(u32, config.httpMaxConcurrent()));
 
         return .{ .multi = multi };
     }
@@ -828,6 +891,7 @@ pub const ErrorReason = enum {
     too_large,
     aborted,
     robots_blocked,
+    bot_challenge,
     other,
 };
 
@@ -850,11 +914,13 @@ pub fn errorReason(err: anyerror) ErrorReason {
         => .tls,
         error.ResponseTooLarge => .too_large,
         error.Abort,
+        error.TransferCanceled,
         error.AbortedByCallback,
         error.AbortAuthChallenge,
         error.SyncWaitInterrupted,
         => .aborted,
         error.RobotsBlocked => .robots_blocked,
+        error.BotChallenge => .bot_challenge,
         else => .other,
     };
 }
@@ -900,6 +966,50 @@ test "isBadPort" {
     }
 }
 
+test "Header.parse" {
+    {
+        const h = Header.parse("Content-Type: text/html; charset=utf-8").?;
+        try testing.expectEqualSlices(u8, "Content-Type", h.name);
+        try testing.expectEqualSlices(u8, "text/html; charset=utf-8", h.value);
+    }
+    {
+        // no space after the colon
+        const h = Header.parse("X-Custom:value").?;
+        try testing.expectEqualSlices(u8, "X-Custom", h.name);
+        try testing.expectEqualSlices(u8, "value", h.value);
+    }
+    {
+        // name and value are trimmed of spaces and tabs
+        const h = Header.parse(" \tAccept \t: \tapplication/json \t").?;
+        try testing.expectEqualSlices(u8, "Accept", h.name);
+        try testing.expectEqualSlices(u8, "application/json", h.value);
+    }
+    {
+        // only the first colon splits; later colons stay in the value
+        const h = Header.parse("Referer: http://example.com:8080/").?;
+        try testing.expectEqualSlices(u8, "Referer", h.name);
+        try testing.expectEqualSlices(u8, "http://example.com:8080/", h.value);
+    }
+    {
+        // empty value
+        const h = Header.parse("X-Empty:").?;
+        try testing.expectEqualSlices(u8, "X-Empty", h.name);
+        try testing.expectEqualSlices(u8, "", h.value);
+    }
+
+    {
+        // Splitting is all `parse` does; a name that isn't an HTTP token still
+        // parses. Callers validate what comes back.
+        const h = Header.parse("Foo Bar: value").?;
+        try testing.expectEqualSlices(u8, "Foo Bar", h.name);
+        try testing.expectEqualSlices(u8, "value", h.value);
+    }
+
+    // no colon, no header
+    try testing.expect(Header.parse("not-a-header") == null);
+    try testing.expect(Header.parse("") == null);
+}
+
 test "Header.firstValue" {
     try testing.expectEqualSlices(u8, "attachment", (Header{ .name = "Content-Disposition", .value = "attachment" }).firstValue());
     // firstValue trims but preserves case (callers compare case-insensitively).
@@ -918,6 +1028,17 @@ test "Header.param" {
     try testing.expect((Header{ .name = "Content-Disposition", .value = "attachment" }).param("filename") == null);
     // Empty values are skipped.
     try testing.expect((Header{ .name = "Content-Disposition", .value = "attachment; filename=\"\"" }).param("filename") == null);
+}
+
+test "StatusText.fromStatusLine" {
+    try testing.expect((StatusText{}).get() == null);
+    try testing.expectEqualSlices(u8, "OK", StatusText.fromStatusLine("HTTP/1.1 200 OK\r\n").get().?);
+    try testing.expectEqualSlices(u8, "HOUSTON WE HAVE A", StatusText.fromStatusLine("HTTP/1.1 503 HOUSTON WE HAVE A\r\n").get().?);
+    try testing.expectEqualSlices(u8, "lowercase", StatusText.fromStatusLine("HTTP/1.0 502 lowercase\r\n").get().?);
+    // curl's synthesized HTTP/2 status line has no phrase
+    try testing.expectEqualSlices(u8, "", StatusText.fromStatusLine("HTTP/2 200 \r\n").get().?);
+    try testing.expectEqualSlices(u8, "", StatusText.fromStatusLine("HTTP/1.1 200\r\n").get().?);
+    try testing.expectEqual(StatusText.MAX_LEN, StatusText.fromStatusLine("HTTP/1.1 200 " ++ "x" ** 200).get().?.len);
 }
 
 test "opensocketCallback: private IPv4 returns CURL_SOCKET_BAD" {
@@ -955,4 +1076,16 @@ test "opensocketCallback: block_private=false allows private IP" {
     defer _ = std.c.close(fd);
 
     try testing.expect(fd >= 0);
+}
+
+test "Connection.inHttpRange: only a real status survives" {
+    const kept = [_]c_long{ 100, 200, 404, 503, 599 };
+    for (kept) |status| {
+        try std.testing.expectEqual(@as(u16, @intCast(status)), Connection.inHttpRange(status));
+    }
+    // 9999 used to survive and then panic in every std.http.Status cast.
+    const dropped = [_]c_long{ -1, 0, 99, 600, 1024, 9999, 65536 };
+    for (dropped) |status| {
+        try std.testing.expectEqual(0, Connection.inHttpRange(status));
+    }
 }

@@ -104,6 +104,7 @@ pub fn define(self: *CustomElementRegistry, name: []const u8, constructor: js.Fu
     }
     gop.key_ptr.* = owned_name;
     gop.value_ptr.* = definition;
+    frame.styleChanged();
 
     // Upgrade any undefined custom elements with this name
     var idx: usize = 0;
@@ -137,7 +138,20 @@ pub fn get(self: *CustomElementRegistry, name: []const u8) ?js.Function.Global {
     return definition.constructor;
 }
 
+pub fn getName(self: *CustomElementRegistry, constructor: js.Function) ?[]const u8 {
+    var it = self._definitions.iterator();
+    while (it.next()) |entry| {
+        if (entry.value_ptr.*.constructor.isEqual(constructor)) {
+            return entry.key_ptr.*;
+        }
+    }
+    return null;
+}
+
 pub fn upgrade(self: *CustomElementRegistry, root: *Node, frame: *Frame) !void {
+    if (root.getDocument(frame)._frame == null) {
+        return;
+    }
     try upgradeNode(self, root, frame);
 }
 
@@ -147,9 +161,7 @@ pub fn whenDefined(self: *CustomElementRegistry, name: []const u8, frame: *Frame
         return local.resolvePromise(definition.constructor);
     }
 
-    validateName(name) catch |err| switch (err) {
-        error.SyntaxError => return local.rejectPromise(.{ .dom_exception = .{ .err = error.SyntaxError } }),
-    };
+    try validateName(name);
 
     const gop = try self._when_defined.getOrPut(frame.arena, name);
     if (gop.found_existing) {
@@ -181,7 +193,9 @@ fn upgradeElement(self: *CustomElementRegistry, element: *Element, frame: *Frame
         return Custom.checkAndAttachBuiltIn(element, frame);
     };
 
-    if (custom._definition != null) return;
+    if (custom._definition != null or custom._upgrade_failed) {
+        return;
+    }
 
     const name = custom._tag_name.str();
     const definition = self._definitions.get(name) orelse return;
@@ -197,21 +211,6 @@ pub fn upgradeCustomElement(custom: *Custom, definition: *CustomElementDefinitio
     custom._disconnected_callback_invoked = false;
 
     const node = custom.asNode();
-    const prev_upgrading = frame._upgrading_element;
-    frame._upgrading_element = node;
-    defer frame._upgrading_element = prev_upgrading;
-
-    var ls: js.Local.Scope = undefined;
-    frame.js.localScope(&ls);
-    defer ls.deinit();
-
-    var caught: js.TryCatch.Caught = .{};
-    _ = ls.toLocal(definition.constructor).newInstance(&caught) catch |err| {
-        log.warn(.js, "custom element upgrade", .{ .name = definition.name, .err = err, .caught = caught });
-        return error.CustomElementUpgradeFailed;
-    };
-
-    // Enqueue attributeChangedCallback for existing observed attributes
     const element = custom.asElement();
     for (element.attributeEntries()) |*attr| {
         const name = lp.String.wrap(attr.name());
@@ -219,12 +218,68 @@ pub fn upgradeCustomElement(custom: *Custom, definition: *CustomElementDefinitio
             Custom.enqueueAttributeChangedCallbackOnElement(element, name, null, .wrap(attr.value()), null, frame);
         }
     }
-
     if (node.isConnected()) {
-        Custom.enqueueConnectedCallbackOnElement(false, element, frame) catch |err| {
-            log.warn(.bug, "ce_reactions enqueue fail", .{ .err = err });
-        };
+        try Custom.enqueueConnectedCallbackOnElement(false, element, frame);
     }
+
+    // During construction the element is precustomized, not yet custom.
+    custom._upgrade_in_progress = true;
+    defer custom._upgrade_in_progress = false;
+
+    const prev_upgrading = frame._upgrading_element;
+    const prev_consumed = frame._upgrading_consumed;
+    frame._upgrading_element = node;
+    frame._upgrading_consumed = false;
+    defer {
+        frame._upgrading_element = prev_upgrading;
+        frame._upgrading_consumed = prev_consumed;
+    }
+
+    var ls: js.Local.Scope = undefined;
+    frame.js.localScope(&ls);
+    defer ls.deinit();
+
+    const local = &ls.local;
+    var try_catch: js.TryCatch = undefined;
+    try_catch.init(local);
+    defer try_catch.deinit();
+
+    const object = ls.toLocal(definition.constructor).newInstanceThrow() catch |err| {
+        if (err == error.ExecutionTerminated) {
+            custom._definition = null;
+            return err;
+        }
+        log.debug(.js, "custom element upgrade", .{ .name = definition.name, .err = err });
+        upgradeFailed(custom);
+        if (try_catch.exceptionValue()) |exc| {
+            frame.window.reportError(exc, frame) catch {};
+        }
+        return error.CustomElementUpgradeFailed;
+    };
+
+    const same = if (object.toZig(*Node)) |result| result == node else |_| false;
+    if (!same) {
+        // the construction result must be the element being upgraded.
+        log.debug(.js, "custom element upgrade", .{ .name = definition.name, .reason = "constructor returned another value" });
+        upgradeFailed(custom);
+        const exc: js.Value = .{
+            .local = local,
+            .handle = local.isolate.createTypeError("custom element constructor must return the upgraded element"),
+        };
+        frame.window.reportError(exc, frame) catch {};
+        return error.CustomElementUpgradeFailed;
+    }
+
+    // Insertions and removals during construction queue nothing, so the
+    // dedup flags must reflect where the constructor left the element.
+    const connected = node.isConnected();
+    custom._connected_callback_invoked = connected;
+    custom._disconnected_callback_invoked = connected == false;
+}
+
+fn upgradeFailed(custom: *Custom) void {
+    custom._definition = null;
+    custom._upgrade_failed = true;
 }
 
 fn validateName(name: []const u8) !void {
@@ -282,12 +337,12 @@ pub const JsApi = struct {
 
     pub const define = bridge.function(CustomElementRegistry.define, .{ .ce_reactions = true });
     pub const get = bridge.function(CustomElementRegistry.get, .{ .null_as_undefined = true });
+    pub const getName = bridge.function(CustomElementRegistry.getName, .{});
     pub const upgrade = bridge.function(CustomElementRegistry.upgrade, .{ .ce_reactions = true });
     pub const whenDefined = bridge.function(CustomElementRegistry.whenDefined, .{});
 };
 
 const testing = @import("../../testing.zig");
 test "WebApi: CustomElementRegistry" {
-    testing.expectLog(&.{ .js, .js, .js, .js, .js, .js, .js, .js, .js, .js, .js, .js });
     try testing.htmlRunner("custom_elements", .{});
 }

@@ -53,17 +53,18 @@ _pulling: bool = false,
 _pull_again: bool = false,
 _cancel: ?Cancel = null,
 _collected: bool = false,
+_disturbed: bool = false, // once cancelled, cannot be consumed again
 
 const UnderlyingSource = struct {
-    start: ?js.Function = null,
-    pull: ?js.Function.Global = null,
     cancel: ?js.Function.Global = null,
+    pull: ?js.Function.Global = null,
+    start: ?js.Function = null,
     type: ?[]const u8 = null,
 };
 
 const QueueingStrategy = struct {
-    size: ?js.Function = null,
     highWaterMark: u32 = 1,
+    size: ?js.Function = null,
 };
 
 pub fn init(src_: ?UnderlyingSource, strategy_: ?QueueingStrategy, exec: *const Execution) !*ReadableStream {
@@ -109,9 +110,20 @@ pub fn initWithData(data: []const u8, exec: *const Execution) !*ReadableStream {
     return stream;
 }
 
+pub fn initWithText(text: []const u8, exec: *const Execution) !*ReadableStream {
+    const stream = try init(null, null, exec);
+
+    if (text.len > 0) {
+        try stream._controller.enqueue(.{ .string = text });
+    }
+    try stream._controller.close();
+
+    return stream;
+}
+
 pub fn getReader(self: *ReadableStream, exec: *const Execution) !*ReadableStreamDefaultReader {
     if (self.getLocked()) {
-        return error.ReaderLocked;
+        return exec.js.typeError("ReadableStream is locked");
     }
 
     const reader = try ReadableStreamDefaultReader.init(self, exec);
@@ -123,7 +135,7 @@ pub fn releaseReader(self: *ReadableStream) void {
     self._reader = null;
 }
 
-pub fn getAsyncIterator(self: *ReadableStream, exec: *const Execution) !*AsyncIterator {
+fn getAsyncIterator(self: *ReadableStream, exec: *const Execution) !*AsyncIterator {
     return AsyncIterator.init(self, exec);
 }
 
@@ -145,7 +157,10 @@ pub fn collectBodyBytes(self: *ReadableStream, arena: std.mem.Allocator) ![]cons
         .closed => {},
     }
 
-    const local = self._execution.js.local.?;
+    var ls: js.Local.Scope = undefined;
+    self._execution.js.localScope(&ls);
+    defer ls.deinit();
+    const local = &ls.local;
 
     var buf = std.Io.Writer.Allocating.init(arena);
     const queue = &self._controller._queue;
@@ -230,6 +245,7 @@ fn shouldCallPull(self: *const ReadableStream) bool {
 
 pub fn cancel(self: *ReadableStream, reason: ?[]const u8, exec: *const Execution) !js.Promise {
     const local = exec.js.local.?;
+    self._disturbed = true;
 
     if (self._state != .readable) {
         if (self._cancel) |c| {
@@ -281,13 +297,13 @@ pub fn cancel(self: *ReadableStream, reason: ?[]const u8, exec: *const Execution
 /// pipeThrough(transform) — pipes this readable stream through a transform stream,
 /// returning the readable side. `transform` is a JS object with `readable` and `writable` properties.
 const PipeTransform = struct {
-    writable: *WritableStream,
     readable: *ReadableStream,
+    writable: *WritableStream,
 };
 
-pub fn pipeThrough(self: *ReadableStream, transform: PipeTransform, exec: *const Execution) !*ReadableStream {
+fn pipeThrough(self: *ReadableStream, transform: PipeTransform, exec: *const Execution) !*ReadableStream {
     if (self.getLocked()) {
-        return error.ReaderLocked;
+        return exec.js.typeError("ReadableStream is locked");
     }
 
     // Start async piping from this stream to the writable side
@@ -299,7 +315,7 @@ pub fn pipeThrough(self: *ReadableStream, transform: PipeTransform, exec: *const
 /// Returns a promise that resolves when piping is complete.
 pub fn pipeTo(self: *ReadableStream, destination: *WritableStream, exec: *const Execution) !js.Promise {
     if (self.getLocked()) {
-        return exec.js.local.?.rejectPromise(.{ .type_error = "ReadableStream is locked" });
+        return exec.js.typeError("ReadableStream is locked");
     }
 
     const local = exec.js.local.?;
@@ -423,7 +439,7 @@ pub const JsApi = struct {
     pub const symbol_async_iterator = bridge.iterator(ReadableStream.getAsyncIterator, .{ .async = true });
 };
 
-pub const AsyncIterator = struct {
+const AsyncIterator = struct {
     _stream: *ReadableStream,
     _reader: *ReadableStreamDefaultReader,
 

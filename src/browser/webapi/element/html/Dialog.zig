@@ -25,26 +25,6 @@ pub fn asNode(self: *Dialog) *Node {
     return self.asElement().asNode();
 }
 
-pub fn getOpen(self: *const Dialog) bool {
-    return self.asConstElement().getAttributeSafe(comptime .wrap("open")) != null;
-}
-
-pub fn setOpen(self: *Dialog, open: bool, frame: *Frame) !void {
-    if (open) {
-        try self.asElement().setAttributeSafe(comptime .wrap("open"), .wrap(""), frame);
-    } else {
-        try self.asElement().removeAttribute(comptime .wrap("open"), frame);
-    }
-}
-
-pub fn getReturnValue(self: *const Dialog) []const u8 {
-    return self.asConstElement().getAttributeSafe(comptime .wrap("returnvalue")) orelse "";
-}
-
-pub fn setReturnValue(self: *Dialog, value: []const u8, frame: *Frame) !void {
-    try self.asElement().setAttributeSafe(comptime .wrap("returnvalue"), .wrap(value), frame);
-}
-
 /// https://html.spec.whatwg.org/multipage/interactive-elements.html#dom-dialog-show
 /// If the open attribute is set, return; otherwise set it to the empty string.
 /// Focus / inert / top-layer steps are no-ops here — no rendering pipeline.
@@ -58,7 +38,7 @@ pub fn show(self: *Dialog, frame: *Frame) !void {
 /// Focus trap, backdrop, and top-layer placement are no-ops — Lightpanda has
 /// no layout/compositor; [open] reflecting through to selectors is what
 /// downstream consumers rely on.
-pub fn showModal(self: *Dialog, frame: *Frame) !void {
+fn showModal(self: *Dialog, frame: *Frame) !void {
     if (self.getOpen()) return error.InvalidStateError;
     try self.asElement().setAttributeSafe(comptime .wrap("open"), .wrap(""), frame);
 }
@@ -72,8 +52,12 @@ pub fn close(self: *Dialog, return_value: ?[]const u8, frame: *Frame) !void {
     if (return_value) |v| {
         try self.asElement().setAttributeSafe(comptime .wrap("returnvalue"), .wrap(v), frame);
     }
-    const event = try Event.init("close", .{ .bubbles = false, .cancelable = false }, frame._page);
+    const event = try Event.init("close", .{ .bubbles = false, .cancelable = false }, frame.page);
     try frame._event_manager.dispatch(self.asElement().asEventTarget(), event);
+}
+
+pub fn getOpen(self: *const Dialog) bool {
+    return self.asConstElement().getAttributeSafe(comptime .wrap("open")) != null;
 }
 
 pub const JsApi = struct {
@@ -85,8 +69,10 @@ pub const JsApi = struct {
         pub var class_id: bridge.ClassId = undefined;
     };
 
-    pub const open = bridge.accessor(Dialog.getOpen, Dialog.setOpen, .{ .ce_reactions = true });
-    pub const returnValue = bridge.accessor(Dialog.getReturnValue, Dialog.setReturnValue, .{});
+    const reflect = Element.Reflect(Dialog);
+
+    pub const open = reflect.boolean("open");
+    pub const returnValue = reflect.string("returnvalue");
 
     pub const show = bridge.function(Dialog.show, .{});
     pub const showModal = bridge.function(Dialog.showModal, .{});

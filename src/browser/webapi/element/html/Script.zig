@@ -54,61 +54,21 @@ pub fn getSrc(self: *Script, frame: *Frame) ![]const u8 {
     return self.asNode().resolveURLReflect(self._src, frame, .{});
 }
 
-pub fn setSrc(self: *Script, src: []const u8, frame: *Frame) !void {
+fn setSrc(self: *Script, src: []const u8, frame: *Frame) !void {
     try self.asElement().setAttributeSafe(comptime .wrap("src"), .wrap(src), frame);
 }
 
-pub fn getType(self: *const Script) []const u8 {
-    return self.asConstElement().getAttributeSafe(comptime .wrap("type")) orelse "";
+fn getAsync(self: *const Script) bool {
+    return self._force_async or self.asConstElement().getAttributeInterned("async") != null;
 }
 
-pub fn setType(self: *Script, value: []const u8, frame: *Frame) !void {
-    return self.asElement().setAttributeSafe(comptime .wrap("type"), .wrap(value), frame);
-}
-
-pub fn getNonce(self: *const Script) []const u8 {
-    return self.asConstElement().getAttributeSafe(comptime .wrap("nonce")) orelse "";
-}
-
-pub fn setNonce(self: *Script, value: []const u8, frame: *Frame) !void {
-    return self.asElement().setAttributeSafe(comptime .wrap("nonce"), .wrap(value), frame);
-}
-
-pub fn getCharset(self: *const Script) []const u8 {
-    return self.asConstElement().getAttributeSafe(comptime .wrap("charset")) orelse "";
-}
-
-pub fn setCharset(self: *Script, value: []const u8, frame: *Frame) !void {
-    return self.asElement().setAttributeSafe(comptime .wrap("charset"), .wrap(value), frame);
-}
-
-pub fn getAsync(self: *const Script) bool {
-    return self._force_async or self.asConstElement().getAttributeSafe(comptime .wrap("async")) != null;
-}
-
-pub fn setAsync(self: *Script, value: bool, frame: *Frame) !void {
+fn setAsync(self: *Script, value: bool, frame: *Frame) !void {
     self._force_async = false;
     if (value) {
         try self.asElement().setAttributeSafe(comptime .wrap("async"), .wrap(""), frame);
     } else {
         try self.asElement().removeAttribute(comptime .wrap("async"), frame);
     }
-}
-
-pub fn getDefer(self: *const Script) bool {
-    return self.asConstElement().getAttributeSafe(comptime .wrap("defer")) != null;
-}
-
-pub fn setDefer(self: *Script, value: bool, frame: *Frame) !void {
-    if (value) {
-        try self.asElement().setAttributeSafe(comptime .wrap("defer"), .wrap(""), frame);
-    } else {
-        try self.asElement().removeAttribute(comptime .wrap("defer"), frame);
-    }
-}
-
-pub fn getNoModule(self: *const Script) bool {
-    return self.asConstElement().getAttributeSafe(comptime .wrap("nomodule")) != null;
 }
 
 pub fn setInnerText(self: *Script, text: []const u8, frame: *Frame) !void {
@@ -135,13 +95,19 @@ pub const JsApi = struct {
         pub var class_id: bridge.ClassId = undefined;
     };
 
+    const reflect = Element.Reflect(Script);
+    pub const crossOrigin = reflect.enumerated("crossorigin", &.{ "anonymous", "use-credentials" }, .{ .missing = null, .nullable = true, .invalid = "anonymous" });
+    pub const integrity = reflect.string("integrity");
+    pub const htmlFor = reflect.string("for");
+    pub const event = reflect.string("event");
+
     pub const src = bridge.accessor(Script.getSrc, Script.setSrc, .{ .ce_reactions = true });
-    pub const @"defer" = bridge.accessor(Script.getDefer, Script.setDefer, .{ .ce_reactions = true });
+    pub const @"defer" = reflect.boolean("defer");
     pub const async = bridge.accessor(Script.getAsync, Script.setAsync, .{ .ce_reactions = true });
-    pub const @"type" = bridge.accessor(Script.getType, Script.setType, .{ .ce_reactions = true });
-    pub const nonce = bridge.accessor(Script.getNonce, Script.setNonce, .{ .ce_reactions = true });
-    pub const charset = bridge.accessor(Script.getCharset, Script.setCharset, .{ .ce_reactions = true });
-    pub const noModule = bridge.accessor(Script.getNoModule, null, .{});
+    pub const @"type" = reflect.string("type");
+    pub const nonce = reflect.string("nonce");
+    pub const charset = reflect.string("charset");
+    pub const noModule = reflect.boolean("nomodule");
     pub const supports = bridge.function(Script.supports, .{ .static = true });
     pub const innerText = bridge.accessor(_innerText, Script.setInnerText, .{ .ce_reactions = true });
     fn _innerText(self: *Script, frame: *const Frame) ![]const u8 {
@@ -161,7 +127,7 @@ pub const Build = struct {
     pub fn complete(node: *Node, _: *Frame) !void {
         const self = node.as(Script);
         const element = self.asElement();
-        self._src = element.getAttributeSafe(comptime .wrap("src")) orelse "";
+        self._src = element.getAttributeInterned("src") orelse "";
     }
 
     pub fn attributeChange(element: *Element, name: String, _: String, frame: *Frame) !void {
@@ -170,7 +136,7 @@ pub const Build = struct {
         }
 
         const self = element.as(Script);
-        self._src = element.getAttributeSafe(comptime .wrap("src")) orelse "";
+        self._src = element.getAttributeInterned("src") orelse "";
         if (self._src.len > 0 and element.asNode().isConnected()) {
             try frame.scriptAddedCallback(false, self);
         }
@@ -196,6 +162,5 @@ pub const Build = struct {
 const testing = @import("../../../../testing.zig");
 test "WebApi: Script" {
     testing.silenceLog(&.{.http});
-    testing.expectLog(&.{ .js, .js });
     try testing.htmlRunner("element/html/script", .{});
 }

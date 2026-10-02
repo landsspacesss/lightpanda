@@ -178,10 +178,6 @@ pub const String = extern struct {
         return p[0..ul];
     }
 
-    pub fn isDeleted(self: *const String) bool {
-        return self.len == tombstone;
-    }
-
     pub fn format(self: String, writer: *std.Io.Writer) !void {
         return writer.writeAll(self.str());
     }
@@ -228,7 +224,7 @@ pub const String = extern struct {
         deleted,
         equal: bool,
     };
-    pub fn eqlSliceOrDeleted(a: String, b: []const u8) EqualOrDeleted {
+    fn eqlSliceOrDeleted(a: String, b: []const u8) EqualOrDeleted {
         if (a.len == tombstone) {
             return .deleted;
         }
@@ -421,6 +417,58 @@ pub fn isOneOf(needle: []const u8, haystack: []const []const u8) bool {
     } else false;
 }
 
+/// Case-insensitive, and swapping two adjacent characters counts as one
+/// edit. Inputs over 64 bytes return `maxInt`; that fits the longest CLI flag.
+fn editDistance(a: []const u8, b: []const u8) usize {
+    const max = 64;
+    if (a.len > max or b.len > max) return std.math.maxInt(usize);
+    var a_buf: [max]u8 = undefined;
+    var b_buf: [max]u8 = undefined;
+    const la = std.ascii.lowerString(&a_buf, a);
+    const lb = std.ascii.lowerString(&b_buf, b);
+
+    var prev2: [max + 1]u8 = undefined;
+    var prev: [max + 1]u8 = undefined;
+    var cur: [max + 1]u8 = undefined;
+    for (0..lb.len + 1) |j| prev[j] = @intCast(j);
+    for (la, 1..) |ca, i| {
+        cur[0] = @intCast(i);
+        for (lb, 1..) |cb, j| {
+            const cost: u8 = if (ca == cb) 0 else 1;
+            cur[j] = @min(@min(prev[j] + 1, cur[j - 1] + 1), prev[j - 1] + cost);
+            if (i > 1 and j > 1 and ca == lb[j - 2] and la[i - 2] == cb) {
+                cur[j] = @min(cur[j], prev2[j - 2] + 1);
+            }
+        }
+        prev2 = prev;
+        prev = cur;
+    }
+    return prev[b.len];
+}
+
+/// The candidate nearest to `name`, within about one edit per three characters
+/// (rustc's rule). A prefix every candidate shares, like a flag's `--`, doesn't
+/// count toward the length. Earlier candidates win ties.
+pub fn closest(name: []const u8, candidates: []const []const u8) ?[]const u8 {
+    if (candidates.len == 0) return null;
+    var shared = candidates[0];
+    for (candidates[1..]) |cand| {
+        shared = shared[0 .. std.mem.indexOfDiff(u8, shared, cand) orelse shared.len];
+    }
+    const typed = if (std.mem.startsWith(u8, name, shared)) name.len - shared.len else name.len;
+    const max_dist = @max(typed, 3) / 3;
+    var best: ?[]const u8 = null;
+    var best_dist: usize = std.math.maxInt(usize);
+    for (candidates) |cand| {
+        const dist = editDistance(name, cand);
+        if (dist < best_dist) {
+            best_dist = dist;
+            best = cand;
+        }
+    }
+    return if (best_dist <= max_dist) best else null;
+}
+
 /// Largest prefix of `bytes` whose length is at most `max_bytes` and
 /// ends on a UTF-8 codepoint boundary. Invalid sequences count as one
 /// byte each so the function never loops.
@@ -513,6 +561,45 @@ test "truncateUtf8" {
     // Invalid leader byte counts as one byte so the loop terminates.
     try testing.expectEqual("\xFF", truncateUtf8("\xFFx", 1));
     try testing.expectEqual("\xFFx", truncateUtf8("\xFFx", 2));
+}
+
+test "editDistance" {
+    try testing.expectEqual(@as(usize, 0), editDistance("", ""));
+    try testing.expectEqual(@as(usize, 0), editDistance("wait-ms", "wait-ms"));
+    try testing.expectEqual(@as(usize, 0), editDistance("Wait-MS", "wait-ms"));
+    try testing.expectEqual(@as(usize, 1), editDistance("wait-mss", "wait-ms"));
+    try testing.expectEqual(@as(usize, 1), editDistance("wait-m", "wait-ms"));
+    try testing.expectEqual(@as(usize, 1), editDistance("wait_ms", "wait-ms"));
+    try testing.expectEqual(@as(usize, 3), editDistance("kitten", "sitting"));
+    try testing.expectEqual(@as(usize, 1), editDistance("dmup", "dump"));
+    try testing.expectEqual(@as(usize, 1), editDistance("ab", "ba"));
+    try testing.expectEqual(@as(usize, 3), editDistance("", "abc"));
+    try testing.expectEqual(@as(usize, 3), editDistance("abc", ""));
+
+    const long = "x" ** 64;
+    try testing.expectEqual(@as(usize, 0), editDistance(long, long));
+    try testing.expectEqual(std.math.maxInt(usize), editDistance(long ++ "x", long));
+}
+
+test "closest" {
+    const names = [_][]const u8{ "--dump", "--wait-ms", "--wait-until", "--insecure-disable-tls-host-verification" };
+    try testing.expectEqual("--wait-ms", closest("--wait-mss", &names));
+    try testing.expectEqual("--dump", closest("--dmup", &names));
+    try testing.expectEqual(null, closest("--dmpx", &names));
+    try testing.expectEqual(null, closest("--totally-wrong", &names));
+    try testing.expectEqual(null, closest("--dump", &.{}));
+    try testing.expectEqual("--insecure-disable-tls-host-verification", closest("--insecure-disable-tls-verification", &names));
+
+    const formats = [_][]const u8{ "html", "markdown", "pdf", "png" };
+    try testing.expectEqual(null, closest("md", &formats));
+    try testing.expectEqual("pdf", closest("pdg", &formats));
+
+    const commands = [_][]const u8{ "fetch", "mcp", "run" };
+    try testing.expectEqual("run", closest("fun", &commands));
+    try testing.expectEqual(null, closest("ab", &commands));
+
+    const tie = [_][]const u8{ "abcd", "abce" };
+    try testing.expectEqual("abcd", closest("abc", &tie));
 }
 
 test "latin1ToUtf8" {

@@ -154,7 +154,7 @@ pub fn asNode(self: *Svg) *Node {
 }
 
 // The nearest ancestor <svg> element, null when this is the outermost svg.
-pub fn getOwnerSvgElement(self: *Svg) ?*Graphics.Svg {
+fn getOwnerSvgElement(self: *Svg) ?*Graphics.Svg {
     var node = self.asNode().parentNode();
     while (node) |n| : (node = n.parentNode()) {
         const element = n.is(Element) orelse return null;
@@ -194,6 +194,5 @@ pub const JsApi = struct {
 
 const testing = @import("../../../testing.zig");
 test "WebApi: Svg" {
-    testing.expectLog(&.{ .not_implemented, .not_implemented });
     try testing.htmlRunner("element/svg", .{});
 }

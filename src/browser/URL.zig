@@ -22,7 +22,7 @@ const U = @import("../sys/url.zig");
 
 const Allocator = std.mem.Allocator;
 
-pub const ResolveOptions = struct {
+const ResolveOptions = struct {
     /// null = don't encode, "UTF-8" = standard percent encoding,
     /// other charset = encode query string using that charset with NCR fallback.
     encoding: ?[]const u8 = null,
@@ -215,16 +215,37 @@ pub fn getPathname(raw: [:0]const u8) []const u8 {
     return raw[path_start..query_or_hash_start];
 }
 
-pub fn getProtocol(raw: [:0]const u8) []const u8 {
+pub fn getProtocol(raw: []const u8) []const u8 {
     const pos = std.mem.indexOfScalarPos(u8, raw, 0, ':') orelse return "";
     return raw[0 .. pos + 1];
 }
 
-pub fn isSecure(raw: [:0]const u8) bool {
+pub fn isSecure(raw: []const u8) bool {
     return std.mem.startsWith(u8, raw, "https:") or std.mem.startsWith(u8, raw, "wss:");
 }
 
-pub fn getHostname(raw: [:0]const u8) []const u8 {
+/// Cryptographic scheme or loopback host. Browsers let such origins use
+/// secure-only features (Secure cookies, prefixed cookie names) so that
+/// plain-http local development behaves like production.
+pub fn isPotentiallyTrustworthy(raw: []const u8) bool {
+    return isSecure(raw) or isLoopbackHost(getHostname(raw));
+}
+
+/// Chromium's net::IsLocalhost. Takes a hostname as returned by
+/// `getHostname`: no port, IPv6 literals still bracketed.
+pub fn isLoopbackHost(hostname: []const u8) bool {
+    const host = std.mem.trimEnd(u8, hostname, ".");
+    if (std.ascii.eqlIgnoreCase(host, "localhost") or std.ascii.endsWithIgnoreCase(host, ".localhost")) {
+        return true;
+    }
+    const address = std.Io.net.IpAddress.parseLiteral(host) catch return false;
+    return switch (address) {
+        .ip4 => |ip4| ip4.bytes[0] == 127,
+        .ip6 => |ip6| std.mem.eql(u8, &ip6.bytes, &([_]u8{0} ** 15 ++ [_]u8{1})),
+    };
+}
+
+pub fn getHostname(raw: []const u8) []const u8 {
     const host = getHost(raw);
     const port_sep = findPortSeparator(host) orelse return host;
     return host[0..port_sep];
@@ -241,7 +262,7 @@ pub fn getOriginHostname(origin: []const u8) []const u8 {
     return host[0..port_sep];
 }
 
-pub fn getPort(raw: [:0]const u8) []const u8 {
+pub fn getPort(raw: []const u8) []const u8 {
     const host = getHost(raw);
     const port_sep = findPortSeparator(host) orelse return "";
     return host[port_sep + 1 ..];
@@ -341,6 +362,21 @@ pub fn getOrigin(allocator: Allocator, raw: [:0]const u8) !?[]const u8 {
     return raw[0..authority_end];
 }
 
+pub fn isSameOrigin(url: []const u8, origin: []const u8) bool {
+    const url_proto = getProtocol(url);
+    const origin_proto = getProtocol(origin);
+    if (!std.mem.eql(u8, url_proto, origin_proto)) return false;
+    if (!std.mem.eql(u8, getHostname(url), getHostname(origin))) return false;
+    return std.mem.eql(u8, effectivePort(url_proto, getPort(url)), effectivePort(origin_proto, getPort(origin)));
+}
+
+fn effectivePort(protocol: []const u8, port: []const u8) []const u8 {
+    if (port.len > 0) return port;
+    if (std.mem.eql(u8, protocol, "https:")) return "443";
+    if (std.mem.eql(u8, protocol, "http:")) return "80";
+    return "";
+}
+
 fn getUserInfo(raw: [:0]const u8) ?[]const u8 {
     const auth = parseAuthority(raw) orelse return null;
     if (!auth.has_user_info) return null;
@@ -365,7 +401,7 @@ pub fn eqlDocument(first: [:0]const u8, second: [:0]const u8) bool {
 }
 
 // Helper function to build a URL from components
-pub fn buildUrl(
+fn buildUrl(
     allocator: Allocator,
     protocol: []const u8,
     host: []const u8,
@@ -998,6 +1034,58 @@ test "URL: resolve validates ASCII punycode (xn--) labels" {
     try testing.expectError(error.TypeError, resolve(testing.arena_allocator, "https://example.com/", "https://xn--a.pt/x", .{}));
 }
 
+test "URL: resolve pops drive-letter lookalike segment for non-file schemes (#2794)" {
+    const Case = struct {
+        base: [:0]const u8,
+        path: [:0]const u8,
+        expected: [:0]const u8,
+    };
+
+    const cases = [_]Case{
+        // A "C:" segment is only a Windows drive letter for file: URLs; for any
+        // other scheme ".." must pop it as an ordinary segment.
+        .{
+            .base = "abc://x/y/z/C:/",
+            .path = "..",
+            .expected = "abc://x/y/z/",
+        },
+        // Special (but non-file) scheme hits the same path.
+        .{
+            .base = "http://x/y/z/C:/",
+            .path = "..",
+            .expected = "http://x/y/z/",
+        },
+        // The "C|" (pipe) form is affected too.
+        .{
+            .base = "abc://x/y/z/C|/",
+            .path = "..",
+            .expected = "abc://x/y/z/",
+        },
+        // Controls: ordinary segments pop regardless of the letter casing.
+        .{
+            .base = "abc://x/y/z/w/",
+            .path = "..",
+            .expected = "abc://x/y/z/",
+        },
+        .{
+            .base = "abc://x/y/z/Ca/",
+            .path = "..",
+            .expected = "abc://x/y/z/",
+        },
+        // A drive-letter lookalike WITHOUT a trailing slash pops fine already.
+        .{
+            .base = "abc://x/y/z/C:",
+            .path = "..",
+            .expected = "abc://x/y/",
+        },
+    };
+
+    for (cases) |case| {
+        const result = try resolve(testing.arena_allocator, case.base, case.path, .{});
+        try testing.expectString(case.expected, result);
+    }
+}
+
 test "URL: resolve with encoding" {
     const Case = struct {
         base: [:0]const u8,
@@ -1390,6 +1478,34 @@ test "URL: getHostname" {
     try testing.expectEqualSlices(u8, "[2001:db8::1]", getHostname("https://[2001:db8::1]/"));
 }
 
+test "URL: isPotentiallyTrustworthy" {
+    for ([_][:0]const u8{
+        "https://example.com/",
+        "http://localhost/",
+        "http://LOCALHOST:3000/x",
+        "http://localhost./",
+        "http://app.localhost/",
+        "http://127.0.0.1:8080/",
+        "http://127.255.255.254/",
+        "http://[::1]:9/",
+    }) |url| {
+        try testing.expect(isPotentiallyTrustworthy(url));
+    }
+
+    for ([_][:0]const u8{
+        "http://example.com/",
+        "http://notlocalhost/",
+        "http://localhost.evil.com/",
+        "http://127.0.0.1.evil.com/",
+        "http://128.0.0.1/",
+        "http://[::2]/",
+        "http://[::ffff:127.0.0.1]/",
+        "about:blank",
+    }) |url| {
+        try testing.expect(!isPotentiallyTrustworthy(url));
+    }
+}
+
 test "URL: getPort" {
     // Regular hosts
     try testing.expectEqualSlices(u8, "8080", getPort("https://example.com:8080/path"));
@@ -1482,6 +1598,56 @@ test "URL: getOrigin" {
         } else {
             try testing.expectEqual(null, result);
         }
+    }
+}
+
+test "URL: isSameOrigin" {
+    const Case = struct {
+        url: [:0]const u8,
+        origin: [:0]const u8,
+        expected: bool,
+    };
+
+    const cases = [_]Case{
+        // Identical origins
+        .{ .url = "https://example.com/path", .origin = "https://example.com", .expected = true },
+        .{ .url = "https://example.com", .origin = "https://example.com", .expected = true },
+
+        // Different scheme
+        .{ .url = "http://example.com/path", .origin = "https://example.com", .expected = false },
+
+        // Different host
+        .{ .url = "https://example.org/path", .origin = "https://example.com", .expected = false },
+
+        // Subdomain is a different origin
+        .{ .url = "https://sub.example.com/path", .origin = "https://example.com", .expected = false },
+
+        // Fastpath false-positive guard: url's host is NOT origin's host,
+        // even though origin is a literal string prefix of url.
+        .{ .url = "https://example.com.evil.com/path", .origin = "https://example.com", .expected = false },
+
+        // Same host, different port
+        .{ .url = "https://example.com:8080/path", .origin = "https://example.com", .expected = false },
+        .{ .url = "https://example.com:8080/path", .origin = "https://example.com:8080", .expected = true },
+        .{ .url = "https://example.com:8080/path", .origin = "https://example.com:9090", .expected = false },
+
+        // origin as a full URL (not just an origin serialization) still works
+        .{ .url = "https://example.com/a", .origin = "https://example.com/b?x=1", .expected = true },
+
+        // userinfo on url must not affect the comparison
+        .{ .url = "https://user:pass@example.com/path", .origin = "https://example.com", .expected = true },
+
+        // path/query/fragment differences are irrelevant to origin
+        .{ .url = "https://example.com/a/b?x=1#f", .origin = "https://example.com/", .expected = true },
+
+        // IPv6 hosts
+        .{ .url = "https://[::1]:8080/path", .origin = "https://[::1]:8080", .expected = true },
+        .{ .url = "https://[::1]:8080/path", .origin = "https://[::1]:9090", .expected = false },
+        .{ .url = "https://[::1]/path", .origin = "https://[2001:db8::1]/", .expected = false },
+    };
+
+    for (cases) |case| {
+        try testing.expectEqual(case.expected, isSameOrigin(case.url, case.origin));
     }
 }
 

@@ -34,7 +34,7 @@ const Media = @This();
 
 pub const Proto = HtmlElement;
 
-pub const ReadyState = enum(u16) {
+const ReadyState = enum(u16) {
     HAVE_NOTHING = 0,
     HAVE_METADATA = 1,
     HAVE_CURRENT_DATA = 2,
@@ -42,7 +42,7 @@ pub const ReadyState = enum(u16) {
     HAVE_ENOUGH_DATA = 4,
 };
 
-pub const NetworkState = enum(u16) {
+const NetworkState = enum(u16) {
     NETWORK_EMPTY = 0,
     NETWORK_IDLE = 1,
     NETWORK_LOADING = 2,
@@ -114,7 +114,7 @@ pub fn as(self: *Media, comptime T: type) *T {
     return self.is(T).?;
 }
 
-pub fn canPlayType(_: *const Media, mime_type: []const u8, frame: *Frame) []const u8 {
+fn canPlayType(_: *const Media, mime_type: []const u8, frame: *Frame) []const u8 {
     const pos = std.mem.indexOfScalar(u8, mime_type, ';') orelse mime_type.len;
     const base_type = std.mem.trim(u8, mime_type[0..pos], &std.ascii.whitespace);
 
@@ -184,15 +184,15 @@ pub fn load(self: *Media, frame: *Frame) !void {
 }
 
 fn dispatchEvent(self: *Media, name: []const u8, frame: *Frame) !void {
-    const event = try Event.init(name, .{ .bubbles = false, .cancelable = false }, frame._page);
+    const event = try Event.init(name, .{ .bubbles = false, .cancelable = false }, frame.page);
     try frame._event_manager.dispatch(self.asElement().asEventTarget(), event);
 }
 
-pub fn getPaused(self: *const Media) bool {
+fn getPaused(self: *const Media) bool {
     return self._paused;
 }
 
-pub fn getCurrentTime(self: *const Media) f64 {
+fn getCurrentTime(self: *const Media) f64 {
     return self._current_time;
 }
 
@@ -200,109 +200,65 @@ pub fn getDuration(_: *const Media) f64 {
     return std.math.nan(f64);
 }
 
-pub fn getReadyState(self: *const Media) u16 {
+fn getReadyState(self: *const Media) u16 {
     return @intFromEnum(self._ready_state);
 }
 
-pub fn getNetworkState(self: *const Media) u16 {
+fn getNetworkState(self: *const Media) u16 {
     return @intFromEnum(self._network_state);
 }
 
-pub fn getEnded(_: *const Media) bool {
+fn getEnded(_: *const Media) bool {
     return false;
 }
 
-pub fn getSeeking(_: *const Media) bool {
+fn getSeeking(_: *const Media) bool {
     return false;
 }
 
-pub fn getError(self: *const Media) ?*MediaError {
+fn getError(self: *const Media) ?*MediaError {
     return self._error;
 }
 
-pub fn getVolume(self: *const Media) f64 {
+fn getVolume(self: *const Media) f64 {
     return self._volume;
 }
 
-pub fn setVolume(self: *Media, value: f64) void {
+fn setVolume(self: *Media, value: f64) void {
     self._volume = @max(0.0, @min(1.0, value));
 }
 
-pub fn getMuted(self: *const Media) bool {
+fn getMuted(self: *const Media) bool {
     return self._muted;
 }
 
-pub fn setMuted(self: *Media, value: bool) void {
+fn setMuted(self: *Media, value: bool) void {
     self._muted = value;
 }
 
-pub fn getPlaybackRate(self: *const Media) f64 {
+fn getPlaybackRate(self: *const Media) f64 {
     return self._playback_rate;
 }
 
-pub fn setPlaybackRate(self: *Media, value: f64) void {
+fn setPlaybackRate(self: *Media, value: f64) void {
     self._playback_rate = value;
 }
 
-pub fn setCurrentTime(self: *Media, value: f64) void {
+fn setCurrentTime(self: *Media, value: f64) void {
     self._current_time = value;
 }
 
 pub fn getSrc(self: *const Media, frame: *Frame) ![]const u8 {
     const element = self.asConstElement();
-    const src = element.getAttributeSafe(comptime .wrap("src")) orelse return "";
+    const src = element.getAttributeInterned("src") orelse return "";
     if (src.len == 0) {
         return "";
     }
     return element.asConstNode().resolveURLReflect(src, frame, .{});
 }
 
-pub fn setSrc(self: *Media, value: []const u8, frame: *Frame) !void {
+fn setSrc(self: *Media, value: []const u8, frame: *Frame) !void {
     try self.asElement().setAttributeSafe(comptime .wrap("src"), .wrap(value), frame);
-}
-
-pub fn getAutoplay(self: *const Media) bool {
-    return self.asConstElement().getAttributeSafe(comptime .wrap("autoplay")) != null;
-}
-
-pub fn setAutoplay(self: *Media, value: bool, frame: *Frame) !void {
-    if (value) {
-        try self.asElement().setAttributeSafe(comptime .wrap("autoplay"), .wrap(""), frame);
-    } else {
-        try self.asElement().removeAttribute(comptime .wrap("autoplay"), frame);
-    }
-}
-
-pub fn getControls(self: *const Media) bool {
-    return self.asConstElement().getAttributeSafe(comptime .wrap("controls")) != null;
-}
-
-pub fn setControls(self: *Media, value: bool, frame: *Frame) !void {
-    if (value) {
-        try self.asElement().setAttributeSafe(comptime .wrap("controls"), .wrap(""), frame);
-    } else {
-        try self.asElement().removeAttribute(comptime .wrap("controls"), frame);
-    }
-}
-
-pub fn getLoop(self: *const Media) bool {
-    return self.asConstElement().getAttributeSafe(comptime .wrap("loop")) != null;
-}
-
-pub fn setLoop(self: *Media, value: bool, frame: *Frame) !void {
-    if (value) {
-        try self.asElement().setAttributeSafe(comptime .wrap("loop"), .wrap(""), frame);
-    } else {
-        try self.asElement().removeAttribute(comptime .wrap("loop"), frame);
-    }
-}
-
-pub fn getPreload(self: *const Media) []const u8 {
-    return self.asConstElement().getAttributeSafe(comptime .wrap("preload")) orelse "auto";
-}
-
-pub fn setPreload(self: *Media, value: []const u8, frame: *Frame) !void {
-    try self.asElement().setAttributeSafe(comptime .wrap("preload"), .wrap(value), frame);
 }
 
 pub const JsApi = struct {
@@ -313,6 +269,10 @@ pub const JsApi = struct {
         pub const prototype_chain = bridge.prototypeChain();
         pub var class_id: bridge.ClassId = undefined;
     };
+
+    const reflect = Element.Reflect(Media);
+    pub const crossOrigin = reflect.enumerated("crossorigin", &.{ "anonymous", "use-credentials" }, .{ .missing = null, .nullable = true, .invalid = "anonymous" });
+    pub const defaultMuted = reflect.boolean("muted");
 
     pub const NETWORK_EMPTY = bridge.property(@intFromEnum(NetworkState.NETWORK_EMPTY), .{ .template = true });
     pub const NETWORK_IDLE = bridge.property(@intFromEnum(NetworkState.NETWORK_IDLE), .{ .template = true });
@@ -327,11 +287,11 @@ pub const JsApi = struct {
 
     pub const src = bridge.accessor(Media.getSrc, Media.setSrc, .{ .ce_reactions = true });
     pub const currentSrc = bridge.accessor(Media.getSrc, null, .{});
-    pub const autoplay = bridge.accessor(Media.getAutoplay, Media.setAutoplay, .{ .ce_reactions = true });
-    pub const controls = bridge.accessor(Media.getControls, Media.setControls, .{ .ce_reactions = true });
-    pub const loop = bridge.accessor(Media.getLoop, Media.setLoop, .{ .ce_reactions = true });
+    pub const autoplay = reflect.boolean("autoplay");
+    pub const controls = reflect.boolean("controls");
+    pub const loop = reflect.boolean("loop");
     pub const muted = bridge.accessor(Media.getMuted, Media.setMuted, .{});
-    pub const preload = bridge.accessor(Media.getPreload, Media.setPreload, .{ .ce_reactions = true });
+    pub const preload = reflect.enumerated("preload", &.{ "none", "metadata", "auto" }, .{ .missing = "auto" });
     pub const volume = bridge.accessor(Media.getVolume, Media.setVolume, .{});
     pub const playbackRate = bridge.accessor(Media.getPlaybackRate, Media.setPlaybackRate, .{});
     pub const currentTime = bridge.accessor(Media.getCurrentTime, Media.setCurrentTime, .{});

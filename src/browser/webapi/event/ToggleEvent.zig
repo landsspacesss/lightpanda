@@ -37,8 +37,8 @@ _new_state: []const u8 = "",
 _source: ?*HtmlElement = null,
 
 const ToggleEventOptions = struct {
-    oldState: []const u8 = "",
     newState: []const u8 = "",
+    oldState: []const u8 = "",
     source: ?*HtmlElement = null,
 };
 
@@ -79,15 +79,15 @@ pub fn asEvent(self: *ToggleEvent) *Event {
     return self._proto;
 }
 
-pub fn getOldState(self: *const ToggleEvent) []const u8 {
+fn getOldState(self: *const ToggleEvent) []const u8 {
     return self._old_state;
 }
 
-pub fn getNewState(self: *const ToggleEvent) []const u8 {
+fn getNewState(self: *const ToggleEvent) []const u8 {
     return self._new_state;
 }
 
-pub fn getSource(self: *const ToggleEvent) ?*HtmlElement {
+fn getSource(self: *const ToggleEvent) ?*HtmlElement {
     return self._source;
 }
 

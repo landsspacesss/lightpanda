@@ -28,8 +28,9 @@ const HtmlElement = @import("../Html.zig");
 const Form = @import("Form.zig");
 const Selection = @import("../../Selection.zig");
 const Event = @import("../../Event.zig");
-const InputEvent = @import("../../event/InputEvent.zig");
 const ValidityState = @import("ValidityState.zig");
+const reflection = @import("../reflection.zig");
+const text_entry = @import("../text_entry.zig");
 
 const TextArea = @This();
 
@@ -37,6 +38,8 @@ pub const Proto = HtmlElement;
 
 _proto_canary: if (lp.IS_DEBUG) *HtmlElement else void = undefined,
 _value: ?[]const u8 = null,
+// Only user edits count for tooLong/tooShort; script and attribute values don't.
+_user_edited: bool = false,
 
 _selection_start: u32 = 0,
 _selection_end: u32 = 0,
@@ -46,26 +49,16 @@ _on_selectionchange: ?js.Function.Global = null,
 _custom_validity: ?[]const u8 = null,
 _validity: ?*ValidityState = null,
 
-pub fn getOnSelectionChange(self: *TextArea) ?js.Function.Global {
+fn getOnSelectionChange(self: *TextArea) ?js.Function.Global {
     return self._on_selectionchange;
 }
 
-pub fn setOnSelectionChange(self: *TextArea, listener: ?js.Function) !void {
+fn setOnSelectionChange(self: *TextArea, listener: ?js.Function) !void {
     if (listener) |listen| {
         self._on_selectionchange = try listen.persistWithThis(self);
     } else {
         self._on_selectionchange = null;
     }
-}
-
-fn dispatchSelectionChangeEvent(self: *TextArea, frame: *Frame) !void {
-    const event = try Event.init("selectionchange", .{ .bubbles = true }, frame._page);
-    try frame._event_manager.dispatch(self.asElement().asEventTarget(), event);
-}
-
-fn dispatchInputEvent(self: *TextArea, data: ?[]const u8, input_type: []const u8, frame: *Frame) !void {
-    const event = try InputEvent.initTrusted(comptime .wrap("input"), .{ .data = data, .inputType = input_type }, frame);
-    try frame._event_manager.dispatch(self.asElement().asEventTarget(), event.asEvent());
 }
 
 pub fn asElement(self: *TextArea) *Element {
@@ -86,11 +79,32 @@ pub fn getValue(self: *const TextArea) []const u8 {
 }
 
 pub fn setValue(self: *TextArea, value: []const u8, frame: *Frame) !void {
+    const changed = std.mem.eql(u8, self.getValue(), value) == false;
+    if (changed == false and self._value != null) {
+        // _value itself isn't changing (not to be mixed up with setValue
+        // being called with the same as the default value, which would need
+        // to dupe)
+        self._user_edited = false;
+        return;
+    }
     const owned = try frame.arena.dupe(u8, value);
     self._value = owned;
+    self._user_edited = false;
+
+    // move the text entry cursor position to the end of the text control
+    if (changed) {
+        self._selection_start = @intCast(owned.len);
+        self._selection_end = @intCast(owned.len);
+        self._selection_direction = .none;
+    }
 }
 
-pub fn getDefaultValue(self: *const TextArea) []const u8 {
+pub fn setUserValue(self: *TextArea, value: []const u8, frame: *Frame) !void {
+    try self.setValue(value, frame);
+    self._user_edited = true;
+}
+
+fn getDefaultValue(self: *const TextArea) []const u8 {
     const node = self.asConstNode();
     if (node.firstChild()) |child| {
         if (child.is(Node.CData.Text)) |txt| {
@@ -100,7 +114,7 @@ pub fn getDefaultValue(self: *const TextArea) []const u8 {
     return "";
 }
 
-pub fn setDefaultValue(self: *TextArea, value: []const u8, frame: *Frame) !void {
+fn setDefaultValue(self: *TextArea, value: []const u8, frame: *Frame) !void {
     const node = self.asNode();
     if (node.firstChild()) |child| {
         if (child.is(Node.CData.Text)) |txt| {
@@ -110,185 +124,44 @@ pub fn setDefaultValue(self: *TextArea, value: []const u8, frame: *Frame) !void 
     }
 
     // No text child exists, create one
-    const text_node = try Frame.node_factory.createTextNode(frame, value);
+    const text_node = try Frame.node_factory.createTextNode(node.getDocument(frame), value);
     _ = try node.appendChild(text_node, frame);
 }
 
-pub fn getDisabled(self: *const TextArea) bool {
-    return self.asConstElement().getAttributeSafe(comptime .wrap("disabled")) != null;
-}
-
-pub fn setDisabled(self: *TextArea, disabled: bool, frame: *Frame) !void {
-    if (disabled) {
-        try self.asElement().setAttributeSafe(comptime .wrap("disabled"), .wrap(""), frame);
-    } else {
-        try self.asElement().removeAttribute(comptime .wrap("disabled"), frame);
-    }
-}
-
-pub fn getName(self: *const TextArea) []const u8 {
-    return self.asConstElement().getAttributeSafe(comptime .wrap("name")) orelse "";
-}
-
-pub fn setName(self: *TextArea, name: []const u8, frame: *Frame) !void {
-    try self.asElement().setAttributeSafe(comptime .wrap("name"), .wrap(name), frame);
-}
-
-pub fn getRequired(self: *const TextArea) bool {
-    return self.asConstElement().getAttributeSafe(comptime .wrap("required")) != null;
-}
-
-pub fn setRequired(self: *TextArea, required: bool, frame: *Frame) !void {
-    if (required) {
-        try self.asElement().setAttributeSafe(comptime .wrap("required"), .wrap(""), frame);
-    } else {
-        try self.asElement().removeAttribute(comptime .wrap("required"), frame);
-    }
-}
-
 pub fn getMaxLength(self: *const TextArea) i32 {
-    const attr = self.asConstElement().getAttributeSafe(comptime .wrap("maxlength")) orelse return -1;
-    return std.fmt.parseInt(i32, attr, 10) catch -1;
-}
-
-pub fn setMaxLength(self: *TextArea, max_length: i32, frame: *Frame) !void {
-    if (max_length < 0) {
-        return error.IndexSizeError;
-    }
-    var buf: [32]u8 = undefined;
-    const value = std.fmt.bufPrint(&buf, "{d}", .{max_length}) catch unreachable;
-    try self.asElement().setAttributeSafe(comptime .wrap("maxlength"), .wrap(value), frame);
+    return reflection.getLimitedLong(self.asConstElement(), comptime .wrap("maxlength"));
 }
 
 pub fn getMinLength(self: *const TextArea) i32 {
-    const attr = self.asConstElement().getAttributeSafe(comptime .wrap("minlength")) orelse return -1;
-    return std.fmt.parseInt(i32, attr, 10) catch -1;
+    return reflection.getLimitedLong(self.asConstElement(), comptime .wrap("minlength"));
 }
 
-pub fn setMinLength(self: *TextArea, min_length: i32, frame: *Frame) !void {
-    if (min_length < 0) {
-        return error.IndexSizeError;
-    }
-    var buf: [32]u8 = undefined;
-    const value = std.fmt.bufPrint(&buf, "{d}", .{min_length}) catch unreachable;
-    try self.asElement().setAttributeSafe(comptime .wrap("minlength"), .wrap(value), frame);
+const entry = text_entry.TextEntry(TextArea);
+
+pub const select = entry.select;
+pub const innerInsert = entry.innerInsert;
+pub const acceptsTextEntry = entry.acceptsTextEntry;
+pub const innerDelete = entry.innerDelete;
+pub const moveCaret = entry.moveCaret;
+pub const caretToEnd = entry.caretToEnd;
+pub const CaretMove = entry.CaretMove;
+pub const getSelectionDirection = entry.getSelectionDirection;
+pub const setSelectionStart = entry.setSelectionStart;
+pub const setSelectionEnd = entry.setSelectionEnd;
+pub const setSelectionRange = entry.setSelectionRange;
+
+// <textarea> always supports selection; <input> only does for some types.
+pub fn selectionAvailable(_: *const TextArea) bool {
+    return true;
 }
 
-pub fn select(self: *TextArea, frame: *Frame) !void {
-    const len = if (self._value) |v| @as(u32, @intCast(v.len)) else 0;
-    try self.setSelectionRange(0, len, null, frame);
-    const event = try Event.init("select", .{ .bubbles = true }, frame._page);
-    try frame._event_manager.dispatch(self.asElement().asEventTarget(), event);
-}
-
-const HowSelected = union(enum) { partial: struct { u32, u32 }, full, none };
-
-fn howSelected(self: *const TextArea) HowSelected {
-    const value = self._value orelse return .none;
-
-    if (self._selection_start == self._selection_end) return .none;
-    if (self._selection_start == 0 and self._selection_end == value.len) return .full;
-    return .{ .partial = .{ self._selection_start, self._selection_end } };
-}
-
-pub fn innerInsert(self: *TextArea, str: []const u8, frame: *Frame) !void {
-    const arena = frame.arena;
-
-    switch (self.howSelected()) {
-        .full => {
-            // if the text area is fully selected, replace the content.
-            const new_value = try arena.dupe(u8, str);
-            try self.setValue(new_value, frame);
-            self._selection_start = @intCast(new_value.len);
-            self._selection_end = @intCast(new_value.len);
-            self._selection_direction = .none;
-            try self.dispatchSelectionChangeEvent(frame);
-        },
-        .partial => |range| {
-            // if the text area is partially selected, replace the selected content.
-            const current_value = self.getValue();
-            const before = current_value[0..range[0]];
-            const remaining = current_value[range[1]..];
-
-            const new_value = try std.mem.concat(
-                arena,
-                u8,
-                &.{ before, str, remaining },
-            );
-            try self.setValue(new_value, frame);
-
-            const new_pos = range[0] + str.len;
-            self._selection_start = @intCast(new_pos);
-            self._selection_end = @intCast(new_pos);
-            self._selection_direction = .none;
-            try self.dispatchSelectionChangeEvent(frame);
-        },
-        .none => {
-            // if the text area is not selected, just insert at cursor.
-            const current_value = self.getValue();
-            const new_value = try std.mem.concat(arena, u8, &.{ current_value, str });
-            try self.setValue(new_value, frame);
-        },
-    }
-    try self.dispatchInputEvent(str, "insertText", frame);
-}
-
-pub fn getSelectionDirection(self: *const TextArea) []const u8 {
-    return @tagName(self._selection_direction);
-}
-
-pub fn getSelectionStart(self: *const TextArea) u32 {
+// Non-null unlike input
+fn getSelectionStart(self: *const TextArea) u32 {
     return self._selection_start;
 }
 
-pub fn setSelectionStart(self: *TextArea, value: u32, frame: *Frame) !void {
-    self._selection_start = value;
-    try self.dispatchSelectionChangeEvent(frame);
-}
-
-pub fn getSelectionEnd(self: *const TextArea) u32 {
+fn getSelectionEnd(self: *const TextArea) u32 {
     return self._selection_end;
-}
-
-pub fn setSelectionEnd(self: *TextArea, value: u32, frame: *Frame) !void {
-    self._selection_end = value;
-    try self.dispatchSelectionChangeEvent(frame);
-}
-
-pub fn setSelectionRange(
-    self: *TextArea,
-    selection_start: u32,
-    selection_end: u32,
-    selection_dir: ?[]const u8,
-    frame: *Frame,
-) !void {
-    const direction = blk: {
-        if (selection_dir) |sd| {
-            break :blk std.meta.stringToEnum(Selection.SelectionDirection, sd) orelse .none;
-        } else break :blk .none;
-    };
-
-    const value = self._value orelse {
-        self._selection_start = 0;
-        self._selection_end = 0;
-        self._selection_direction = .none;
-        return;
-    };
-
-    const len_u32: u32 = @intCast(value.len);
-    var start: u32 = if (selection_start > len_u32) len_u32 else selection_start;
-    const end: u32 = if (selection_end > len_u32) len_u32 else selection_end;
-
-    // If end is less than start, both are equal to end.
-    if (end < start) {
-        start = end;
-    }
-
-    self._selection_direction = direction;
-    self._selection_start = start;
-    self._selection_end = end;
-
-    try self.dispatchSelectionChangeEvent(frame);
 }
 
 pub fn getForm(self: *TextArea, frame: *Frame) ?*Form {
@@ -315,7 +188,7 @@ pub fn getForm(self: *TextArea, frame: *Frame) ?*Form {
     return null;
 }
 
-pub fn getLabels(self: *TextArea, frame: *Frame) !js.Array {
+fn getLabels(self: *TextArea, frame: *Frame) !js.Array {
     return @import("Label.zig").getControlLabels(self.asElement(), frame);
 }
 
@@ -323,17 +196,17 @@ pub fn getLabels(self: *TextArea, frame: *Frame) !js.Array {
 // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#the-constraint-validation-api
 
 pub fn getWillValidate(self: *const TextArea) bool {
-    return !self.getDisabled();
+    return !self.asConstElement().isDisabled();
 }
 
-pub fn getValidity(self: *TextArea, frame: *Frame) !*ValidityState {
+fn getValidity(self: *TextArea, frame: *Frame) !*ValidityState {
     if (self._validity) |v| return v;
     const v = try frame._factory.create(ValidityState{ ._owner = self.asElement() });
     self._validity = v;
     return v;
 }
 
-pub fn getValidationMessage(self: *const TextArea) []const u8 {
+fn getValidationMessage(self: *const TextArea) []const u8 {
     if (!self.getWillValidate()) return "";
     if (self._custom_validity) |msg| return msg;
     if (self.suffersValueMissing()) return "Please fill out this field.";
@@ -347,16 +220,16 @@ pub fn checkValidity(self: *TextArea, frame: *Frame) !bool {
     const v = ValidityState{ ._owner = self.asElement() };
     if (v.getValid(frame)) return true;
 
-    const event = try Event.initTrusted(comptime .wrap("invalid"), .{ .cancelable = true }, frame._page);
+    const event = try Event.initTrusted(comptime .wrap("invalid"), .{ .cancelable = true }, frame.page);
     try frame._event_manager.dispatch(self.asElement().asEventTarget(), event);
     return false;
 }
 
-pub fn reportValidity(self: *TextArea, frame: *Frame) !bool {
+fn reportValidity(self: *TextArea, frame: *Frame) !bool {
     return self.checkValidity(frame);
 }
 
-pub fn setCustomValidity(self: *TextArea, message: []const u8, frame: *Frame) !void {
+fn setCustomValidity(self: *TextArea, message: []const u8, frame: *Frame) !void {
     if (message.len == 0) {
         self._custom_validity = null;
     } else {
@@ -375,6 +248,7 @@ pub fn suffersValueMissing(self: *const TextArea) bool {
 }
 
 pub fn suffersTooLong(self: *const TextArea) bool {
+    if (!self._user_edited) return false;
     const value = self._value orelse return false;
     const max = self.getMaxLength();
     if (max < 0) return false;
@@ -383,12 +257,17 @@ pub fn suffersTooLong(self: *const TextArea) bool {
 }
 
 pub fn suffersTooShort(self: *const TextArea) bool {
+    if (!self._user_edited) return false;
     const value = self._value orelse return false;
     if (value.len == 0) return false;
     const min = self.getMinLength();
     if (min < 0) return false;
     const count = std.unicode.utf8CountCodepoints(value) catch value.len;
     return count < @as(usize, @intCast(min));
+}
+
+pub fn getRequired(self: *const TextArea) bool {
+    return self.asConstElement().getAttributeInterned("required") != null;
 }
 
 pub const JsApi = struct {
@@ -400,6 +279,14 @@ pub const JsApi = struct {
         pub var class_id: bridge.ClassId = undefined;
     };
 
+    const reflect = Element.Reflect(TextArea);
+    pub const rows = reflect.unsignedLong("rows", .{ .default = 2, .positive = true, .fallback = true });
+    pub const cols = reflect.unsignedLong("cols", .{ .default = 20, .positive = true, .fallback = true });
+    pub const readOnly = reflect.boolean("readonly");
+    pub const wrap = reflect.string("wrap");
+    pub const placeholder = reflect.string("placeholder");
+    pub const dirName = reflect.string("dirname");
+
     pub const labels = bridge.accessor(TextArea.getLabels, null, .{});
     pub const willValidate = bridge.accessor(TextArea.getWillValidate, null, .{});
     pub const validity = bridge.accessor(TextArea.getValidity, null, .{});
@@ -410,11 +297,11 @@ pub const JsApi = struct {
     pub const onselectionchange = bridge.accessor(TextArea.getOnSelectionChange, TextArea.setOnSelectionChange, .{});
     pub const value = bridge.accessor(TextArea.getValue, TextArea.setValue, .{});
     pub const defaultValue = bridge.accessor(TextArea.getDefaultValue, TextArea.setDefaultValue, .{ .ce_reactions = true });
-    pub const disabled = bridge.accessor(TextArea.getDisabled, TextArea.setDisabled, .{ .ce_reactions = true });
-    pub const name = bridge.accessor(TextArea.getName, TextArea.setName, .{ .ce_reactions = true });
-    pub const required = bridge.accessor(TextArea.getRequired, TextArea.setRequired, .{ .ce_reactions = true });
-    pub const maxLength = bridge.accessor(TextArea.getMaxLength, TextArea.setMaxLength, .{ .ce_reactions = true });
-    pub const minLength = bridge.accessor(TextArea.getMinLength, TextArea.setMinLength, .{ .ce_reactions = true });
+    pub const disabled = reflect.boolean("disabled");
+    pub const name = reflect.string("name");
+    pub const required = reflect.boolean("required");
+    pub const maxLength = reflect.limitedLong("maxlength");
+    pub const minLength = reflect.limitedLong("minlength");
     pub const form = bridge.accessor(TextArea.getForm, null, .{});
     pub const select = bridge.function(TextArea.select, .{});
 
