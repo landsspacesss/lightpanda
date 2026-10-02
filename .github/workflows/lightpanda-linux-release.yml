@@ -1,0 +1,115 @@
+name: Build Lightpanda (Linux, glibc) & Release
+
+# Builds Lightpanda for Linux (glibc — Debian/Ubuntu/Alpine-with-gcompat NOT
+# supported) from an upstream ref, using lightpanda's OWN build pipeline: the
+# `./.github/actions/install` composite action fetches the matching prebuilt V8
+# from the zig-v8-fork release, then we build the snapshot + the browser exactly
+# like upstream's release.yml.
+#
+# WHY glibc, NOT musl: zig-v8-fork publishes prebuilt V8 only for
+# linux_x86_64 / linux_aarch64 (glibc), macos and ios — there is no musl build,
+# and building V8 for musl ourselves does not yield the v8__* symbols current
+# lightpanda links against (that was the failure of the earlier musl workflow).
+# A true musl target would require building V8 for musl with matching flags.
+#
+# Run manually: Actions -> "Build Lightpanda (Linux, glibc) & Release".
+# Auto-runs on new upstream tags via auto-lightpanda-release.yml.
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Release tag (e.g. linux-test-1)'
+        required: true
+        default: 'linux-test-1'
+      upstream_ref:
+        description: 'Upstream lightpanda-io/browser ref (tag/branch/sha). Default: main'
+        required: false
+        default: 'main'
+  workflow_call:
+    inputs:
+      release_tag:
+        required: true
+        type: string
+      upstream_ref:
+        required: false
+        type: string
+        default: 'main'
+
+permissions:
+  contents: write
+
+jobs:
+  build-linux:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-22.04
+            cpu_flag: -Dcpu=x86_64
+          - arch: aarch64
+            # apt.llvm.org has no LLVM 23 repo for 22.04 (see zig-v8-fork PR #199)
+            runner: ubuntu-24.04-arm
+            cpu_flag: -Dcpu=generic
+
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: lightpanda-io/browser
+          ref: ${{ inputs.upstream_ref }}
+          fetch-depth: 0
+
+      - uses: ./.github/actions/install
+        with:
+          os: linux
+          arch: ${{ matrix.arch }}
+
+      - name: v8 snapshot
+        run: zig build -Dprebuilt_v8_path=v8/libc_v8.a -Doptimize=ReleaseFast snapshot_creator -- src/snapshot.bin
+
+      - name: zig build
+        run: >-
+          zig build
+          -Dsnapshot_path=../../snapshot.bin
+          -Dprebuilt_v8_path=v8/libc_v8.a
+          -Doptimize=ReleaseFast
+          -Dorderfile=orderfile/lightpanda.ld
+          ${{ matrix.cpu_flag }}
+          -Dversion=${{ inputs.release_tag }}
+
+      - name: Rename binary
+        run: mv zig-out/bin/lightpanda lightpanda-${{ matrix.arch }}-linux
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: lightpanda-${{ matrix.arch }}-linux
+          path: lightpanda-${{ matrix.arch }}-linux
+          retention-days: 7
+
+  release:
+    needs: build-linux
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Download binaries
+        uses: actions/download-artifact@v4
+        with:
+          path: assets
+          merge-multiple: true
+      - name: Inspect assets
+        run: ls -la assets/ && file assets/lightpanda-*-linux
+      - name: Create Release & upload
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.release_tag }}
+          name: "Lightpanda linux (glibc) ${{ inputs.release_tag }}"
+          body: |
+            Linux **glibc** builds of Lightpanda (Debian/Ubuntu) — no extra deps.
+            - Built from upstream `lightpanda-io/browser` ref: `${{ inputs.upstream_ref }}`
+            - x86_64 (lightpanda-x86_64-linux) and aarch64 (lightpanda-aarch64-linux)
+          files: assets/lightpanda-*-linux
+          prerelease: true

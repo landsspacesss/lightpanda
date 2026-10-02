@@ -1,15 +1,11 @@
-name: Auto-build musl on new upstream tag
+name: Auto-build Lightpanda on new upstream tag
 
 # Upstream tags do NOT propagate to a fork, so we poll upstream on a schedule.
-# When a new semver tag appears and we haven't released "<tag>-musl" yet, we run
-# the musl build for that exact upstream tag.
+# When a new semver tag appears and we haven't released "<tag>-linux" yet, we
+# build the glibc Linux binaries for that exact upstream tag.
 #
-# The build is invoked as a REUSABLE workflow (`uses:`) rather than dispatched
-# with `gh workflow run`: a dispatch made with the default GITHUB_TOKEN does not
-# start a new workflow run (GitHub blocks token-triggered recursion), so `uses:`
-# is the only reliable way to chain them.
-#
-# Force a check now: Actions tab -> "Auto-build musl on new upstream tag" -> Run workflow.
+# Invoked as a REUSABLE workflow (`uses:`) rather than `gh workflow run`: a
+# dispatch made with the default GITHUB_TOKEN does not start a new run.
 
 on:
   schedule:
@@ -45,22 +41,19 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          TAG="${{ steps.up.outputs.tag }}-musl"
+          TAG="${{ steps.up.outputs.tag }}-linux"
           if gh release view "$TAG" -R "${{ github.repository }}" >/dev/null 2>&1; then
-            echo "release $TAG already exists — nothing to do"
-            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "release $TAG already exists — nothing to do"; echo "exists=true" >> "$GITHUB_OUTPUT"
           else
-            echo "release $TAG not found — will build"
-            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "release $TAG not found — will build"; echo "exists=false" >> "$GITHUB_OUTPUT"
           fi
 
   build-and-release:
     needs: detect
     if: needs.detect.outputs.exists == 'false'
-    uses: ./.github/workflows/musl-release.yml
+    uses: ./.github/workflows/lightpanda-linux-release.yml
     with:
-      release_tag: ${{ needs.detect.outputs.tag }}-musl
+      release_tag: ${{ needs.detect.outputs.tag }}-linux
       upstream_ref: ${{ needs.detect.outputs.tag }}
-      prerelease: 'true'
     permissions:
       contents: write
