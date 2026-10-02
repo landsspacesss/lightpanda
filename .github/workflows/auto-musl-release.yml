@@ -1,0 +1,60 @@
+name: Auto-build musl on new upstream tag
+
+# Upstream tags do NOT propagate to a fork, so we poll upstream on a schedule.
+# When a new semver tag appears and we haven't released "<tag>-musl" yet, we
+# dispatch the musl-release workflow pinned to that upstream tag.
+#
+# To force a check from the Actions tab: Run workflow -> Auto-build musl on new upstream tag.
+
+on:
+  schedule:
+    - cron: '23 */6 * * *'   # every 6 hours (UTC)
+  workflow_dispatch: {}
+
+permissions:
+  contents: write   # read existing releases
+  actions: write    # dispatch the build workflow
+
+jobs:
+  detect-and-trigger:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Find latest upstream semver tag
+        id: up
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG=$(gh api repos/lightpanda-io/browser/tags --paginate --jq '.[].name' \
+                 | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1)
+          echo "latest upstream semver tag: ${TAG:-<none>}"
+          [ -n "$TAG" ] || { echo "no semver tag found upstream"; exit 1; }
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Check whether we already released it
+        id: rel
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.up.outputs.tag }}-musl"
+          if gh release view "$TAG" -R "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "release $TAG already exists — nothing to do"
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "release $TAG not found — will build"
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Trigger musl build for the new tag
+        if: steps.rel.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh workflow run musl-release.yml -R "${{ github.repository }}" \
+            -f release_tag="${{ steps.up.outputs.tag }}-musl" \
+            -f upstream_ref="${{ steps.up.outputs.tag }}" \
+            -f prerelease="true"
+          echo "dispatched musl-release.yml for upstream ${{ steps.up.outputs.tag }} -> release ${{ steps.up.outputs.tag }}-musl"

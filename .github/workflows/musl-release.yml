@@ -4,9 +4,31 @@ on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: 'Release tag (e.g. musl-test-1)'
+        description: 'Release tag (e.g. v0.2.6-musl)'
         required: true
         default: 'musl-test-1'
+      upstream_ref:
+        description: 'Upstream lightpanda-io/browser ref (tag/branch/sha) to build. Default: main'
+        required: false
+        default: 'main'
+      prerelease:
+        description: 'Mark the release as a prerelease'
+        required: false
+        default: 'true'
+  # Allow the auto-trigger workflow (and other workflows) to call this.
+  workflow_call:
+    inputs:
+      release_tag:
+        required: true
+        type: string
+      upstream_ref:
+        required: false
+        type: string
+        default: 'main'
+      prerelease:
+        required: false
+        type: string
+        default: 'true'
 
 permissions:
   contents: write
@@ -14,6 +36,9 @@ permissions:
 env:
   TARGET_ARM: aarch64-linux-musl
   TARGET_X64: x86_64-linux-musl
+  # Number of attempts for the flaky V8 fetch/build (chromium.googlesource.com
+  # occasionally returns HTTP 400 / "expected 'packfile'" during gclient sync).
+  V8_BUILD_ATTEMPTS: '3'
 
 jobs:
   # ============ Job A: V8 x86_64 musl ============
@@ -42,9 +67,24 @@ jobs:
           key: v8-musl-x64-${{ github.run_id }}
           restore-keys: |
             v8-musl-x64-
+      - name: Git resilience for chromium fetches
+        run: |
+          git config --global http.postBuffer 524288000
+          git config --global http.lowSpeedLimit 0
+          git config --global http.lowSpeedTime 999999
       - name: Build V8 x64 (musl)
         if: steps.cache.outputs.cache-hit != 'true'
-        run: zig build -Dtarget="${{ env.TARGET_X64 }}" -Doptimize=ReleaseSafe build-v8
+        run: |
+          for i in $(seq 1 "$V8_BUILD_ATTEMPTS"); do
+            echo "=== V8 x64 build attempt $i/$V8_BUILD_ATTEMPTS ==="
+            if zig build -Dtarget="${{ env.TARGET_X64 }}" -Doptimize=ReleaseSafe build-v8; then
+              echo "V8 x64 build succeeded on attempt $i"; exit 0
+            fi
+            echo "attempt $i failed; clearing partial checkouts and retrying"
+            find .lp-cache -type d -name _bad_scm -prune -exec rm -rf {} + 2>/dev/null || true
+            sleep 20
+          done
+          echo "V8 x64 build failed after $V8_BUILD_ATTEMPTS attempts"; exit 1
       - name: Pack V8 lib
         run: |
           if [ ! -f libc_v8_musl_x64.a ]; then
@@ -91,9 +131,24 @@ jobs:
           key: v8-musl-arm-${{ github.run_id }}
           restore-keys: |
             v8-musl-
+      - name: Git resilience for chromium fetches
+        run: |
+          git config --global http.postBuffer 524288000
+          git config --global http.lowSpeedLimit 0
+          git config --global http.lowSpeedTime 999999
       - name: Build V8 arm (musl)
         if: steps.cache.outputs.cache-hit != 'true'
-        run: zig build -Dtarget="${{ env.TARGET_ARM }}" -Doptimize=ReleaseSafe build-v8
+        run: |
+          for i in $(seq 1 "$V8_BUILD_ATTEMPTS"); do
+            echo "=== V8 arm build attempt $i/$V8_BUILD_ATTEMPTS ==="
+            if zig build -Dtarget="${{ env.TARGET_ARM }}" -Doptimize=ReleaseSafe build-v8; then
+              echo "V8 arm build succeeded on attempt $i"; exit 0
+            fi
+            echo "attempt $i failed; clearing partial checkouts and retrying"
+            find .lp-cache -type d -name _bad_scm -prune -exec rm -rf {} + 2>/dev/null || true
+            sleep 20
+          done
+          echo "V8 arm build failed after $V8_BUILD_ATTEMPTS attempts"; exit 1
       - name: Pack V8 lib
         run: |
           if [ ! -f libc_v8_musl_arm.a ]; then
@@ -118,6 +173,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: lightpanda-io/browser
+          ref: ${{ inputs.upstream_ref }}
           fetch-depth: 0
       - name: Install apt deps
         run: sudo apt-get update && sudo apt-get install -y wget xz-utils ca-certificates clang make git binutils
@@ -174,6 +230,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: lightpanda-io/browser
+          ref: ${{ inputs.upstream_ref }}
           fetch-depth: 0
       - name: Install apt deps
         run: sudo apt-get update && sudo apt-get install -y wget xz-utils ca-certificates clang make git binutils
@@ -243,7 +300,8 @@ jobs:
           name: "Lightpanda musl build ${{ inputs.release_tag }}"
           body: |
             Static musl builds of Lightpanda (zero-dependency, works on Alpine/musl systems).
+            - Built from upstream `lightpanda-io/browser` ref: `${{ inputs.upstream_ref }}`
             - arm64 (aarch64-linux-musl)
             - x86_64 (x86_64-linux-musl)
           files: release-assets/lightpanda-*-musl
-          prerelease: true
+          prerelease: ${{ inputs.prerelease == 'true' }}
