@@ -76,9 +76,7 @@ jobs:
           -Dsnapshot_path=../../snapshot.bin
           -Dprebuilt_v8_path=v8/libc_v8.a
           -Doptimize=ReleaseFast
-          -Dorderfile=orderfile/lightpanda.ld
           ${{ matrix.cpu_flag }}
-          -Dversion=${{ inputs.release_tag }}
 
       - name: Rename binary
         run: mv zig-out/bin/lightpanda lightpanda-${{ matrix.arch }}-linux
